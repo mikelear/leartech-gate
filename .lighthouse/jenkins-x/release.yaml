@@ -18,36 +18,18 @@ spec:
         steps:
         - name: ""
           resources: {}
-    # Template-as-canary: this template IS a self-deployable service with
-    # a real /api/v1/example endpoint, so it ships a real OpenAPI spec at
-    # docs/swagger.json and runs the codegen task on every release —
-    # exercising the full chain (build → tag → generate → publish to
-    # GitHub Packages + mono-repos). If the catalog's codegen task ever
-    # breaks, the template's release fails before any consumer notices.
+    # leartech-gate is a CLI binary invoked from a Tekton task in promotion-PR
+    # presubmits. It has no public HTTP API — the cmd/server stub from the
+    # golden template is kept for chart deployability but doesn't expose
+    # routes worth generating clients for.
     #
-    # Cloners: the published clients become your service's real clients
-    # automatically after clone-and-rename, because the values below
-    # scale to whatever your repo + endpoints become.
-    - name: openapi-generation
-      runAfter: ["from-build-pack"]
-      resources: {}
-      taskSpec:
-        metadata: {}
-        stepTemplate:
-          image: uses:mikelear/leartech-pipeline-catalog/tasks/openapi-generation/release.yaml@main
-          name: ""
-          resources: {}
-          workingDir: /workspace/source
-          env:
-          - name: SwaggerServiceName
-            value: GoServiceTemplate
-          - name: SpecPath
-            value: ./docs/swagger.json
-          - name: OutputLanguages
-            value: angular typescript go python rust
-        steps:
-        - name: ""
-          resources: {}
+    # Therefore: no openapi-generation task. The golden template's
+    # release.yaml runs codegen unconditionally; for CLI services we skip
+    # it. Captured as bootstrap gap #5 in session-0-lessons.md.
+    #
+    # Phase 1 hardening (proposed): make the openapi-generation task
+    # opt-in via a flag in the consumer repo's release.yaml, so CLI services
+    # don't have to remove it (cleaner inheritance from the catalog task).
   podTemplate:
     tolerations:
     - key: sku
