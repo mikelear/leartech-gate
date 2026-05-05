@@ -23,11 +23,21 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /out/server \
     ./cmd/server
 
+# leartech-gate is a CLI invoked from a Tekton task — build that binary too.
+# (Bootstrap gap #6 from Session 0c: golden Dockerfile only builds cmd/server;
+#  new sub-commands need explicit additions here.)
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION}" \
+    -o /out/gate-cli \
+    ./cmd/gate-cli
+
 # ---- runtime stage ----
 # distroless/static:nonroot — no shell, no package manager, uid 65532
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/server /server
+COPY --from=build /out/gate-cli /gate-cli
 # --chown=65532:65532 makes the generated OpenAPI spec readable under any
 # kernel/filesystem policy that double-checks ownership beyond the 0644
 # world-read bits (some nodes reject root-owned files in distroless/nonroot
