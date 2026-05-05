@@ -1,0 +1,76 @@
+definitions:
+  handlers.ExampleResponse:
+    properties:
+      message:
+        example: hello
+        type: string
+      service:
+        example: leartech-gate
+        type: string
+    type: object
+info:
+  contact: {}
+  description: Golden Go service template — replace this description after cloning.
+  license:
+    name: Apache 2.0
+    url: http://www.apache.org/licenses/LICENSE-2.0.html
+  title: Leartech Go Service Template API
+  version: 0.0.1
+paths:
+  /api/v1/example:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.ExampleResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Example endpoint
+      tags:
+      - example
+  /health/live:
+    get:
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Liveness probe
+      tags:
+      - health
+  /health/ready:
+    get:
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: Service Unavailable
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Readiness probe
+      tags:
+      - health
+securityDefinitions:
+  BearerAuth:
+    description: Bearer token (JWT) issued by the leartech auth service.
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

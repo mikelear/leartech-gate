@@ -1,0 +1,61 @@
+{{- if and .Values.migrations.enabled .Values.database.enabled }}
+# goose post-install/post-upgrade migration job.
+#
+# Runs before app pods roll — `--wait` on the Release ensures migrations
+# complete (or fail) before the Deployment's new ReplicaSet starts.
+#
+# Per golden-std: migrations via goose, run as Helm post-install/post-upgrade.
+# Never at app start (avoids lock storms when replicas > 1).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "leartech.fullname" . }}-migrate
+  labels:
+    {{- include "leartech.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      # Don't set `job-name` here — K8s strict-validates that it must equal
+      # the Job's full name, and the Job controller fills it in automatically
+      # (`batch.kubernetes.io/job-name: <full-name>`). A fixed value here
+      # collides on apply ("must be '<full-name>'") and breaks the boot job
+      # on stricter clusters (caught when AZ boot stalled for ~4 days).
+      labels:
+        {{- include "leartech.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "leartech.serviceAccountName" . }}
+      securityContext:
+        {{- include "leartech.podSecurityContext" . | nindent 8 }}
+      containers:
+      - name: goose
+        image: "{{ .Values.migrations.image.repository }}:{{ .Values.migrations.image.tag }}"
+        args:
+        - postgres
+        - $(DATABASE_URL)
+        - up
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.database.secretName }}
+              key: {{ .Values.database.secretKey }}
+        - name: GOOSE_MIGRATION_DIR
+          value: /migrations
+        securityContext:
+          {{- include "leartech.containerSecurityContext" . | nindent 10 }}
+        volumeMounts:
+        - name: migrations
+          mountPath: /migrations
+          readOnly: true
+      volumes:
+      - name: migrations
+        configMap:
+          name: {{ include "leartech.fullname" . }}-migrations
+{{- end }}

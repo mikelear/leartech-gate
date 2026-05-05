@@ -1,0 +1,59 @@
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  creationTimestamp: null
+  name: release
+spec:
+  pipelineSpec:
+    tasks:
+    - name: from-build-pack
+      resources: {}
+      taskSpec:
+        metadata: {}
+        stepTemplate:
+          image: uses:mikelear/leartech-pipeline-catalog/tasks/go/release.yaml@main
+          name: ""
+          resources: {}
+          workingDir: /workspace/source
+        steps:
+        - name: ""
+          resources: {}
+    # Template-as-canary: this template IS a self-deployable service with
+    # a real /api/v1/example endpoint, so it ships a real OpenAPI spec at
+    # docs/swagger.json and runs the codegen task on every release —
+    # exercising the full chain (build → tag → generate → publish to
+    # GitHub Packages + mono-repos). If the catalog's codegen task ever
+    # breaks, the template's release fails before any consumer notices.
+    #
+    # Cloners: the published clients become your service's real clients
+    # automatically after clone-and-rename, because the values below
+    # scale to whatever your repo + endpoints become.
+    - name: openapi-generation
+      runAfter: ["from-build-pack"]
+      resources: {}
+      taskSpec:
+        metadata: {}
+        stepTemplate:
+          image: uses:mikelear/leartech-pipeline-catalog/tasks/openapi-generation/release.yaml@main
+          name: ""
+          resources: {}
+          workingDir: /workspace/source
+          env:
+          - name: SwaggerServiceName
+            value: GoServiceTemplate
+          - name: SpecPath
+            value: ./docs/swagger.json
+          - name: OutputLanguages
+            value: angular typescript go python rust
+        steps:
+        - name: ""
+          resources: {}
+  podTemplate:
+    tolerations:
+    - key: sku
+      operator: Equal
+      value: build
+      effect: NoSchedule
+  serviceAccountName: tekton-bot
+  timeout: 12h0m0s
+status: {}
