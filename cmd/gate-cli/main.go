@@ -36,6 +36,13 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 // Helmfile is the minimum of the helmfile schema we care about for the spike.
@@ -97,6 +104,9 @@ func main() {
 		prefix           = flag.String("prefix", envOr("RESULT_STORE_PREFIX", "results/v1"), "GCS path prefix (no trailing slash)")
 		cluster          = flag.String("cluster", envOr("CLUSTER_TAG", "unknown"), "cluster tag (gcp/az)")
 		dryRun           = flag.Bool("dry-run", false, "log decisions but don't post PR check")
+		watchNamespace   = flag.String("watch-namespace", envOr("WATCH_NAMESPACE", "jx-staging"), "namespace where Arrival CRs live")
+		enablePostDeploy = flag.Bool("enable-post-deploy-quill", envOr("ENABLE_POST_DEPLOY_QUILL", "true") == "true", "evaluate the post-deploy-tests quill against Arrival CRs")
+		kubeconfigPath   = flag.String("kubeconfig", envOr("KUBECONFIG", ""), "kubeconfig file (empty = in-cluster)")
 		_                = flag.Bool("help", false, "show this message")
 	)
 	flag.Parse()
@@ -110,7 +120,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[%s] %s\n", level, fmt.Sprintf(format, args...))
 	}
 
-	logf("info", "starting leartech-gate (cluster=%s, bucket=%s, prefix=%s, dry-run=%t)", *cluster, *bucket, *prefix, *dryRun)
+	logf("info", "starting leartech-gate (cluster=%s, bucket=%s, prefix=%s, dry-run=%t, post-deploy=%t)",
+		*cluster, *bucket, *prefix, *dryRun, *enablePostDeploy)
 
 	// 1. Parse helmfile → list of services + versions
 	hf, err := parseHelmfile(*helmfilePath)
@@ -120,10 +131,27 @@ func main() {
 	}
 	logf("info", "helmfile %s lists %d releases", *helmfilePath, len(hf.Releases))
 
-	// 2. For each release, evaluate the shift-left-tests quill
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// Build dynamic K8s client for the post-deploy quill (Arrival CR reads).
+	// Best-effort — if it fails, post-deploy quill is skipped with a logged
+	// warning; shift-left still runs. Lets the gate degrade gracefully if
+	// the qa-gate task SA is misconfigured rather than failing every PR.
+	var dynClient dynamic.Interface
+	if *enablePostDeploy {
+		c, err := buildDynClient(*kubeconfigPath)
+		if err != nil {
+			logf("warn", "post-deploy quill disabled — k8s client init failed: %v", err)
+			*enablePostDeploy = false
+		} else {
+			dynClient = c
+		}
+	}
+
+	// 2. For each release, evaluate every enabled quill. Verdict-per-quill
+	// merged into a single ServiceVerdict for the table; failure of any
+	// quill fails the whole release. The reason field shows which quill(s).
 	verdicts := make([]ServiceVerdict, 0, len(hf.Releases))
 	allPass := true
 	for _, rel := range hf.Releases {
@@ -131,9 +159,23 @@ func main() {
 			logf("warn", "skipping release with empty name or version: %+v", rel)
 			continue
 		}
-		v := evaluateShiftLeftQuill(ctx, *qaMgmtRaw, *bucket, *prefix, *cluster, rel)
-		verdicts = append(verdicts, v)
-		if !v.Pass {
+		shift := evaluateShiftLeftQuill(ctx, *qaMgmtRaw, *bucket, *prefix, *cluster, rel)
+
+		merged := shift // start from shift-left's verdict
+		merged.Reason = fmt.Sprintf("shift-left: %s", shift.Reason)
+
+		if *enablePostDeploy && dynClient != nil {
+			pd := evaluatePostDeployQuill(ctx, dynClient, *watchNamespace, rel)
+			merged.Reason = merged.Reason + "; post-deploy: " + pd.Reason
+			if !pd.Pass {
+				merged.Pass = false
+				merged.MissingTests = append(merged.MissingTests, pd.MissingTests...)
+				merged.FailedTests = append(merged.FailedTests, pd.FailedTests...)
+			}
+		}
+
+		verdicts = append(verdicts, merged)
+		if !merged.Pass {
 			allPass = false
 		}
 	}
@@ -417,4 +459,127 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// arrivalGVR is the GroupVersionResource for the Arrival CR managed by
+// leartech-arrivals-observer.
+var arrivalGVR = schema.GroupVersionResource{
+	Group:    "qa.leartech.com",
+	Version:  "v1alpha1",
+	Resource: "arrivals",
+}
+
+// evaluatePostDeployQuill checks that a service+version has an Arrival CR
+// in phase=Passed in the watched namespace. The Arrival CR is created by
+// leartech-arrivals-observer when a ReplicaSet for the version lands in
+// staging; the controller then dispatches test Jobs and finalizes the
+// arrival's phase. So phase=Passed = "post-deploy tests passed in staging".
+//
+// Behaviour:
+//   - Arrival not found → pass-through (service hasn't deployed yet, OR is
+//     in a namespace this gate doesn't watch, OR isn't in the services
+//     map — all valid non-fail cases).
+//   - phase=Passed → pass.
+//   - phase=Skipped → pass-through (no testPacks configured for the
+//     service in the chart values map; explicit opt-out).
+//   - phase=Failed | Timeout → fail; populate FailedTests with names.
+//   - phase=Pending | Testing | "" → fail (still in-flight; gate must
+//     produce a verdict).
+func evaluatePostDeployQuill(ctx context.Context, dyn dynamic.Interface, namespace string, rel Release) ServiceVerdict {
+	v := ServiceVerdict{Service: rel.Name, Version: rel.Version, Pass: true}
+
+	selector := fmt.Sprintf("qa.leartech.com/service=%s,qa.leartech.com/version=%s", rel.Name, rel.Version)
+	list, err := dyn.Resource(arrivalGVR).Namespace(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
+			v.Reason = fmt.Sprintf("Arrival lookup skipped: %v", err)
+			return v
+		}
+		v.Pass = false
+		v.Reason = fmt.Sprintf("k8s list arrivals failed: %v", err)
+		return v
+	}
+	if len(list.Items) == 0 {
+		v.Reason = fmt.Sprintf("no Arrival in %s for %s/%s (not yet deployed?)", namespace, rel.Name, rel.Version)
+		return v
+	}
+
+	// If multiple arrivals match (same service+version recorded under
+	// different namespaces, etc.), prefer the most-recent finalized one;
+	// fall back to the most-recent in-progress one.
+	arr := pickLatestArrival(list.Items)
+	phase, _, _ := unstructured.NestedString(arr.Object, "status", "phase")
+	switch phase {
+	case "Passed":
+		v.Reason = "Arrival.phase=Passed"
+	case "Skipped":
+		v.Reason = "Arrival.phase=Skipped (no testPacks configured)"
+	case "Failed", "Timeout":
+		v.Pass = false
+		v.Reason = fmt.Sprintf("Arrival.phase=%s", phase)
+		tests, _, _ := unstructured.NestedSlice(arr.Object, "status", "tests")
+		for _, t := range tests {
+			tm, ok := t.(map[string]any)
+			if !ok {
+				continue
+			}
+			st, _ := tm["status"].(string)
+			if st == "Failed" || st == "Timeout" {
+				name, _ := tm["name"].(string)
+				v.FailedTests = append(v.FailedTests, name+" ("+st+")")
+			}
+		}
+	default: // Pending, Testing, ""
+		v.Pass = false
+		v.Reason = fmt.Sprintf("Arrival.phase=%q (not yet finalized)", phase)
+	}
+	return v
+}
+
+// pickLatestArrival prefers the latest finalized Arrival; falls back to
+// the latest creation-timestamp item if none finalized. Lets the quill
+// produce a stable verdict even if multiple Arrivals match the same
+// service+version (e.g. across re-deploys in the same namespace).
+func pickLatestArrival(items []unstructured.Unstructured) *unstructured.Unstructured {
+	if len(items) == 0 {
+		return nil
+	}
+	var (
+		bestFinal  *unstructured.Unstructured
+		bestFinalT string
+		bestAny    *unstructured.Unstructured
+	)
+	for i := range items {
+		it := &items[i]
+		fAt, _, _ := unstructured.NestedString(it.Object, "status", "finalizedAt")
+		if fAt != "" && (bestFinal == nil || fAt > bestFinalT) {
+			bestFinal = it
+			bestFinalT = fAt
+		}
+		if bestAny == nil || it.GetCreationTimestamp().After(bestAny.GetCreationTimestamp().Time) {
+			bestAny = it
+		}
+	}
+	if bestFinal != nil {
+		return bestFinal
+	}
+	return bestAny
+}
+
+// buildDynClient prefers in-cluster, falls back to kubeconfig file for
+// out-of-cluster runs.
+func buildDynClient(kubeconfigPath string) (dynamic.Interface, error) {
+	var (
+		cfg *rest.Config
+		err error
+	)
+	if kubeconfigPath != "" {
+		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	} else {
+		cfg, err = rest.InClusterConfig()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return dynamic.NewForConfig(cfg)
 }
