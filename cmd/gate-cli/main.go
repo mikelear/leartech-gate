@@ -199,17 +199,37 @@ func main() {
 	logf("info", "PASS: all quills green")
 }
 
-// parseHelmfile reads + unmarshals the helmfile.yaml.
+// parseHelmfile reads + unmarshals the helmfile.yaml. Handles multi-doc
+// YAML (the JX3 build-cluster shape: `environments:` doc first, then a
+// `---` separator, then the doc with `repositories:` + `releases:`).
+// Returns the first doc that has a non-empty Releases list — accommodates
+// both sandbox single-doc and JX3 multi-doc layouts without the caller
+// needing to know which.
 func parseHelmfile(path string) (*Helmfile, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	var hf Helmfile
-	if err := yaml.Unmarshal(data, &hf); err != nil {
-		return nil, fmt.Errorf("yaml: %w", err)
+	defer f.Close()
+	dec := yaml.NewDecoder(f)
+	var first Helmfile
+	for {
+		var hf Helmfile
+		err := dec.Decode(&hf)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("yaml decode: %w", err)
+		}
+		if first.Releases == nil {
+			first = hf // remember the first doc as a fallback
+		}
+		if len(hf.Releases) > 0 {
+			return &hf, nil
+		}
 	}
-	return &hf, nil
+	return &first, nil
 }
 
 // evaluateShiftLeftQuill runs the single quill for one release.

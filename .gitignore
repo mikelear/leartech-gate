@@ -22,4 +22,6 @@ pr-logs/
 # Merged lint config — fetched+merged at runtime from the catalog base
 .golangci.base.yml
 .golangci.merged.yml
-gate-cli
+# Local-only built binary (the source dir is cmd/gate-cli/; this matches
+# only the bare-name compiled artifact left by `go build .`).
+/gate-cli
