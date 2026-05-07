@@ -22,3 +22,4 @@ pr-logs/
 # Merged lint config — fetched+merged at runtime from the catalog base
 .golangci.base.yml
 .golangci.merged.yml
+gate-cli
