@@ -553,6 +553,34 @@ func evaluatePostDeployQuill(ctx context.Context, dyn dynamic.Interface, namespa
 		v.Pass = false
 		v.Reason = fmt.Sprintf("Arrival.phase=%q (not yet finalized)", phase)
 	}
+
+	// Append forensics summary if present. Forensics-runner populates
+	// status.forensics.summary when it finishes a Tempo span-diff. We
+	// surface non-zero counts in the verdict so engineers see the regression
+	// summary inline with the gate's PR comment instead of digging into
+	// kubectl get arrival -o yaml.
+	if summary, ok, _ := unstructured.NestedMap(arr.Object, "status", "forensics", "summary"); ok {
+		parts := []string{}
+		if n, _ := summary["latency_regressions"].(int64); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d latency regressions", n))
+		}
+		if n, _ := summary["error_rate_regressions"].(int64); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d error-rate regressions", n))
+		}
+		if n, _ := summary["new"].(int64); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d new endpoints", n))
+		}
+		if n, _ := summary["missing"].(int64); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d missing endpoints", n))
+		}
+		if len(parts) > 0 {
+			diffURL, _, _ := unstructured.NestedString(arr.Object, "status", "forensics", "diffUrl")
+			v.Reason = v.Reason + "; forensics: " + strings.Join(parts, ", ")
+			if diffURL != "" {
+				v.Reason = v.Reason + " ([diff](" + diffURL + "))"
+			}
+		}
+	}
 	return v
 }
 
