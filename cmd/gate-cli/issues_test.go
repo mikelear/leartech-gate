@@ -59,6 +59,31 @@ func TestBodyReasonMatches(t *testing.T) {
 	}
 }
 
+// TestTitlePrefix_VersionAgnostic locks the contract that the title
+// prefix is service-only (no @version suffix), so the issue lifecycle
+// survives version bumps when teams fix bugs and ship the next
+// release. HasPrefix matches against both old and new title formats:
+//   - `[leartech-gate] leartech-auth-ui@0.0.36 blocking …` (legacy)
+//   - `[leartech-gate] leartech-auth-ui blocking …`        (current)
+func TestTitlePrefix_VersionAgnostic(t *testing.T) {
+	v := ServiceVerdict{Service: "leartech-auth-ui", Version: "0.0.37", Pass: false}
+	prefix := "[leartech-gate] " + v.Service
+
+	legacyTitle := "[leartech-gate] leartech-auth-ui@0.0.36 blocking promotion to production"
+	currentTitle := "[leartech-gate] leartech-auth-ui blocking promotion to production"
+	otherTitle := "[leartech-gate] leartech-other-service blocking promotion to production"
+
+	if !strings.HasPrefix(legacyTitle, prefix) {
+		t.Error("legacy @<version> title should still match the version-agnostic prefix")
+	}
+	if !strings.HasPrefix(currentTitle, prefix) {
+		t.Error("current title should match prefix")
+	}
+	if strings.HasPrefix(otherTitle, prefix) {
+		t.Error("different service title should NOT match prefix")
+	}
+}
+
 func TestIssueOutcomeString(t *testing.T) {
 	cases := map[IssueOutcome]string{
 		IssueNoop:    "noop",

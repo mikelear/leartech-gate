@@ -95,19 +95,27 @@ func (o IssueOutcome) String() string {
 }
 
 // EnsureBlockingIssue handles the open/update/close lifecycle for one
-// (service, version) verdict against the service's repo. Best-effort:
-// errors are returned but the caller logs and continues; gate verdict
-// is not affected by issue-API outcomes.
+// service's verdict against its repo. Best-effort: errors are returned
+// but the caller logs and continues; gate verdict is not affected by
+// issue-API outcomes.
+//
+// One issue per service per repo. Title is version-agnostic
+// (`[leartech-gate] <service> blocking promotion to production`) so
+// the lifecycle survives version bumps — when the team fixes the
+// underlying bug + ships a new version, the same issue gets re-used:
+// updated body if still failing on the new version, auto-closed when
+// the new version passes. Body carries the current failing version +
+// reason for context.
 //
 // State machine:
 //   - verdict.Pass  + no open issue → noop
 //   - verdict.Pass  + open issue    → close (auto-resolve)
 //   - !verdict.Pass + no open issue → create
 //   - !verdict.Pass + open issue    → update body (idempotent — only
-//     POSTs an update comment if the reason text changed)
+//     POSTs an update comment if reason or version changed)
 func (c *IssueClient) EnsureBlockingIssue(ctx context.Context, v ServiceVerdict) (IssueOutcome, error) {
 	repo := c.Owner + "/" + v.Service
-	titlePrefix := fmt.Sprintf("[leartech-gate] %s@%s", v.Service, v.Version)
+	titlePrefix := fmt.Sprintf("[leartech-gate] %s", v.Service)
 
 	existing, err := c.findOpenIssue(ctx, repo, titlePrefix)
 	if err != nil {
@@ -118,7 +126,9 @@ func (c *IssueClient) EnsureBlockingIssue(ctx context.Context, v ServiceVerdict)
 		if existing == nil {
 			return IssueNoop, nil
 		}
-		// Auto-close on verdict flip back to green.
+		// Auto-close on verdict flip back to green. The issue body
+		// will reference the failing version; close comment names the
+		// passing version that resolved it for clarity.
 		closeBody := fmt.Sprintf(
 			"Resolved by %s — gate now reports `%s@%s` as PASS. Closing automatically.",
 			c.gitOpsPRLink(), v.Service, v.Version,
@@ -144,21 +154,23 @@ func (c *IssueClient) EnsureBlockingIssue(ctx context.Context, v ServiceVerdict)
 		return IssueCreated, nil
 	}
 
-	// Existing issue — only post an update comment if the reason text
-	// changed. Compare against the issue body (which carries the marker
-	// + reason). Skip noisy "still failing" updates.
-	if strings.Contains(existing.Body, gateBodyMarker) && bodyReasonMatches(existing.Body, v.Reason) {
+	// Existing issue — only post an update comment if the body
+	// (containing reason + version) actually changed. Skip noisy
+	// "still failing" updates when nothing's different from last run.
+	if strings.Contains(existing.Body, gateBodyMarker) &&
+		bodyReasonMatches(existing.Body, v.Reason) &&
+		strings.Contains(existing.Body, "@"+v.Version+"`") {
 		return IssueNoop, nil
 	}
 	updateComment := fmt.Sprintf(
-		"Verdict re-evaluated by %s — still blocking. Latest reason:\n\n> %s\n",
-		c.gitOpsPRLink(), v.Reason,
+		"Verdict re-evaluated by %s for `%s@%s` — still blocking. Latest reason:\n\n> %s\n",
+		c.gitOpsPRLink(), v.Service, v.Version, v.Reason,
 	)
 	if err := c.commentOnIssue(ctx, repo, existing.Number, updateComment); err != nil {
 		return IssueErrored, fmt.Errorf("update-comment: %w", err)
 	}
-	// Also patch the body so the marker carries the latest reason
-	// (lets the next gate run skip if reason still matches).
+	// Also patch the body so the marker carries the latest version+reason
+	// (lets the next gate run skip if both still match).
 	if err := c.patchIssueBody(ctx, repo, existing.Number, body); err != nil {
 		return IssueErrored, fmt.Errorf("patch-body: %w", err)
 	}
