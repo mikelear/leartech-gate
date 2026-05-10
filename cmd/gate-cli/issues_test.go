@@ -12,6 +12,7 @@ func TestRenderIssueBody_PassThroughVerdict(t *testing.T) {
 		Pass:        false,
 		Reason:      "shift-left: no required-tests entry; post-deploy: Arrival.phase=Failed",
 		FailedTests: []string{"end2end-ui (Failed)"},
+		FailedPacks: []string{"end2end-ui"},
 	}
 	body := c.renderIssueBody(v)
 
@@ -29,6 +30,56 @@ func TestRenderIssueBody_PassThroughVerdict(t *testing.T) {
 	}
 	if !strings.Contains(body, "https://github.com/mikelear/jx-build-cluster-gsm/pull/291") {
 		t.Error("body should back-link to GitOps PR")
+	}
+}
+
+// TestRenderIssueBody_ArtifactLinks locks the contract that issue
+// bodies carry per-failed-pack links to the Playwright HTML report +
+// GCS listing when bucket+pathTemplate are configured. Without them
+// (e.g. dry-run / unit tests with default IssueClient), no Artifacts
+// section renders.
+func TestRenderIssueBody_ArtifactLinks(t *testing.T) {
+	c := &IssueClient{
+		Owner: "mikelear", GitOpsRepo: "mikelear/jx-build-cluster-gsm", GitOpsPullNo: "291",
+		Bucket:       "test-artifacts-product-first",
+		PathTemplate: "results/v1/post-deploy/{{.Cluster}}/{{.Namespace}}/{{.Service}}/{{.Version}}/{{.Pack}}",
+		Cluster:      "gcp",
+		Namespace:    "jx-staging",
+	}
+	v := ServiceVerdict{
+		Service: "leartech-auth-ui", Version: "0.0.36",
+		Pass:        false,
+		Reason:      "Arrival.phase=Failed",
+		FailedTests: []string{"end2end-ui (Failed)"},
+		FailedPacks: []string{"end2end-ui"},
+	}
+	body := c.renderIssueBody(v)
+
+	wantHTML := "https://storage.googleapis.com/test-artifacts-product-first/results/v1/post-deploy/gcp/jx-staging/leartech-auth-ui/0.0.36/end2end-ui/playwright-report/index.html"
+	if !strings.Contains(body, wantHTML) {
+		t.Errorf("issue body missing HTML report link\n want: %s\n body: %s", wantHTML, body)
+	}
+	if !strings.Contains(body, "trace.playwright.dev") {
+		t.Error("body should mention trace.playwright.dev for trace.zip viewing")
+	}
+	if !strings.Contains(body, "**Artifacts**") {
+		t.Error("body should have an Artifacts section header")
+	}
+}
+
+func TestRenderIssueBody_NoArtifactsWhenBucketUnset(t *testing.T) {
+	// Default IssueClient (Bucket/PathTemplate empty) → no artifact section.
+	c := &IssueClient{Owner: "mikelear", GitOpsRepo: "x/y", GitOpsPullNo: "1"}
+	v := ServiceVerdict{
+		Service: "x", Version: "0.1", Pass: false,
+		FailedPacks: []string{"end2end-ui"},
+	}
+	body := c.renderIssueBody(v)
+	if strings.Contains(body, "**Artifacts**") {
+		t.Error("artifact section should not render when bucket/template empty")
+	}
+	if strings.Contains(body, "trace.playwright.dev") {
+		t.Error("trace.playwright.dev mention should not render when bucket/template empty")
 	}
 }
 

@@ -219,7 +219,7 @@ func main() {
 	// logged, never fail the gate. Skipped entirely when disabled or
 	// when the GitHub client can't be built.
 	if *enableIssueCreation && !*dryRun {
-		ic, err := NewIssueClient(*issueRepoOwner)
+		ic, err := NewIssueClient(*issueRepoOwner, *bucket, *postDeployPathTpl, *cluster, *watchNamespace)
 		if err != nil {
 			logf("warn", "issue creation disabled — %v", err)
 		} else {
