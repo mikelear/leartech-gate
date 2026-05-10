@@ -236,6 +236,14 @@ func (c *IssueClient) findOpenIssue(ctx context.Context, repo, titlePrefix strin
 	apiURL := githubAPIBase + "/search/issues?q=" + url.QueryEscape(q)
 	body, err := c.getJSON(ctx, apiURL)
 	if err != nil {
+		// Repo doesn't exist (chart-only deps like auth-postgresql,
+		// auth-mongodb that aren't real leartech repos). GitHub returns
+		// 422 Unprocessable Entity for `repo:` queries against missing
+		// repos. Treat as "no issue" rather than an error so we don't
+		// spam warnings on every gate run for every chart dep.
+		if strings.Contains(err.Error(), "→ 422") || strings.Contains(err.Error(), "→ 404") {
+			return nil, nil
+		}
 		return nil, err
 	}
 	var resp struct {
