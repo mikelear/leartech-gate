@@ -42,12 +42,25 @@ type IssueClient struct {
 	GitOpsRepo   string // owner/name of the GitOps repo (for back-link)
 	GitOpsPullNo string // PR number on the GitOps repo
 	HTTP         *http.Client
+
+	// Artifact-link rendering — same path layout as the verdict
+	// comment. Empty Bucket/PathTemplate ⇒ links omitted from issue
+	// body (e.g. dry-run / local invocations without a result-store).
+	Bucket       string
+	PathTemplate string
+	Cluster      string
+	Namespace    string
 }
 
 // NewIssueClient builds an IssueClient from the same env vars used by
 // postPRCommentAndCheck. Returns nil + error if any required var missing
 // — caller should treat as a soft-disable (log + continue).
-func NewIssueClient(serviceRepoOwner string) (*IssueClient, error) {
+//
+// bucket/pathTemplate/cluster/namespace mirror the verdict-comment
+// renderer args; passed through so issue bodies carry the same
+// per-failed-pack artifact links (HTML report + trace.zip listing).
+// Empty bucket or template ⇒ links silently omitted.
+func NewIssueClient(serviceRepoOwner, bucket, pathTemplate, cluster, namespace string) (*IssueClient, error) {
 	token := os.Getenv("GITHUB_TOKEN")
 	gitOpsOwner := os.Getenv("REPO_OWNER")
 	gitOpsRepo := os.Getenv("REPO_NAME")
@@ -64,6 +77,10 @@ func NewIssueClient(serviceRepoOwner string) (*IssueClient, error) {
 		GitOpsRepo:   gitOpsOwner + "/" + gitOpsRepo,
 		GitOpsPullNo: pullNo,
 		HTTP:         &http.Client{Timeout: 15 * time.Second},
+		Bucket:       bucket,
+		PathTemplate: pathTemplate,
+		Cluster:      cluster,
+		Namespace:    namespace,
 	}, nil
 }
 
@@ -203,10 +220,54 @@ func (c *IssueClient) renderIssueBody(v ServiceVerdict) string {
 		}
 		fmt.Fprintln(&b)
 	}
+	// Per-failed-pack artifact links — same content as the verdict
+	// comment but rendered into the issue body so service-repo owners
+	// can drill into failures without round-tripping to the GitOps PR.
+	c.appendArtifactLinks(&b, v)
 	fmt.Fprintf(&b, "**Blocking PR:** %s\n\n", c.gitOpsPRLink())
 	fmt.Fprintln(&b, "---")
-	fmt.Fprintln(&b, "_This issue is opened and managed by `leartech-gate` when a quill fails. It auto-closes when the gate reports PASS for the same `service@version`. Comment `/override leartech-gate` on the GitOps PR to bypass the gate without fixing the underlying issue._")
+	fmt.Fprintln(&b, "_This issue is opened and managed by `leartech-gate` when a quill fails. It auto-closes when the gate reports PASS for the same `service`. Comment `/override leartech-gate` on the GitOps PR to bypass the gate without fixing the underlying issue._")
 	return b.String()
+}
+
+// appendArtifactLinks writes a section linking to the Playwright HTML
+// report + GCS test-results listing for each failed pack. Silently
+// no-ops when the IssueClient wasn't configured with a bucket/template
+// (e.g. in tests, or dry-run mode).
+func (c *IssueClient) appendArtifactLinks(b *strings.Builder, v ServiceVerdict) {
+	if c.Bucket == "" || c.PathTemplate == "" || len(v.FailedPacks) == 0 {
+		return
+	}
+	rendered := false
+	for _, pack := range v.FailedPacks {
+		prefix, err := renderPostDeployPathPrefix(c.PathTemplate, pathVars{
+			Cluster: c.Cluster, Namespace: c.Namespace,
+			Service: v.Service, Version: v.Version, Pack: pack,
+		})
+		if err != nil || prefix == "" {
+			continue
+		}
+		reportURL := renderPlaywrightReportURL(c.Bucket, prefix)
+		listingURL := renderTestResultsListingURL(c.Bucket, prefix)
+		if reportURL == "" {
+			continue
+		}
+		if !rendered {
+			fmt.Fprintln(b, "**Artifacts** (per failed pack):")
+			fmt.Fprintln(b)
+			rendered = true
+		}
+		fmt.Fprintf(b, "- `%s`: [HTML report](%s)", pack, reportURL)
+		if listingURL != "" {
+			fmt.Fprintf(b, " · [trace.zip listing](%s)", listingURL)
+		}
+		fmt.Fprintln(b)
+	}
+	if rendered {
+		fmt.Fprintln(b)
+		fmt.Fprintln(b, "_Open trace.zip files in https://trace.playwright.dev/ for an interactive timeline of each failure._")
+		fmt.Fprintln(b)
+	}
 }
 
 func (c *IssueClient) gitOpsPRLink() string {
