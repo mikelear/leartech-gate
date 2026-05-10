@@ -22,6 +22,16 @@ import (
 	"time"
 )
 
+// githubAPIBase is the GitHub REST API root. Configurable via
+// GITHUB_API_URL env (mirrors the gh CLI convention) for GHE deployments;
+// defaults to the public endpoint.
+var githubAPIBase = func() string {
+	if v := os.Getenv("GITHUB_API_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "https://api.github.com"
+}()
+
 // IssueClient wraps GitHub REST calls for issue management. Reuses the
 // same env vars (GITHUB_TOKEN, REPO_OWNER, REPO_NAME, PULL_NUMBER) as
 // the verdict-comment poster — tekton-bot's GitHub App token already
@@ -211,7 +221,7 @@ type ghIssue struct {
 func (c *IssueClient) findOpenIssue(ctx context.Context, repo, titlePrefix string) (*ghIssue, error) {
 	// Search restricted to the service repo + open state + our title prefix.
 	q := fmt.Sprintf("repo:%s is:issue is:open in:title %s", repo, titlePrefix)
-	apiURL := "https://api.github.com/search/issues?q=" + url.QueryEscape(q)
+	apiURL := githubAPIBase + "/search/issues?q=" + url.QueryEscape(q)
 	body, err := c.getJSON(ctx, apiURL)
 	if err != nil {
 		return nil, err
@@ -231,8 +241,11 @@ func (c *IssueClient) findOpenIssue(ctx context.Context, repo, titlePrefix strin
 }
 
 func (c *IssueClient) createIssue(ctx context.Context, repo, title, body string) (int, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/issues", repo)
-	payload, _ := json.Marshal(map[string]any{"title": title, "body": body})
+	apiURL := fmt.Sprintf("%s/repos/%s/issues", githubAPIBase, repo)
+	payload, err := json.Marshal(map[string]any{"title": title, "body": body})
+	if err != nil {
+		return 0, fmt.Errorf("marshal issue payload: %w", err)
+	}
 	resp, err := c.postJSON(ctx, apiURL, payload, http.StatusCreated)
 	if err != nil {
 		return 0, err
@@ -240,44 +253,65 @@ func (c *IssueClient) createIssue(ctx context.Context, repo, title, body string)
 	var out struct {
 		Number int `json:"number"`
 	}
-	_ = json.Unmarshal(resp, &out)
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return 0, fmt.Errorf("parse create-issue response: %w", err)
+	}
 	return out.Number, nil
 }
 
 func (c *IssueClient) commentOnIssue(ctx context.Context, repo string, number int, body string) error {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/issues/%d/comments", repo, number)
-	payload, _ := json.Marshal(map[string]any{"body": body})
-	_, err := c.postJSON(ctx, apiURL, payload, http.StatusCreated)
+	apiURL := fmt.Sprintf("%s/repos/%s/issues/%d/comments", githubAPIBase, repo, number)
+	payload, err := json.Marshal(map[string]any{"body": body})
+	if err != nil {
+		return fmt.Errorf("marshal comment payload: %w", err)
+	}
+	_, err = c.postJSON(ctx, apiURL, payload, http.StatusCreated)
 	return err
 }
 
 func (c *IssueClient) patchIssueBody(ctx context.Context, repo string, number int, body string) error {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/issues/%d", repo, number)
-	payload, _ := json.Marshal(map[string]any{"body": body})
-	_, err := c.patchJSON(ctx, apiURL, payload, http.StatusOK)
+	apiURL := fmt.Sprintf("%s/repos/%s/issues/%d", githubAPIBase, repo, number)
+	payload, err := json.Marshal(map[string]any{"body": body})
+	if err != nil {
+		return fmt.Errorf("marshal patch payload: %w", err)
+	}
+	_, err = c.patchJSON(ctx, apiURL, payload, http.StatusOK)
 	return err
 }
 
 func (c *IssueClient) closeIssue(ctx context.Context, repo string, number int) error {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/issues/%d", repo, number)
-	payload, _ := json.Marshal(map[string]any{"state": "closed"})
-	_, err := c.patchJSON(ctx, apiURL, payload, http.StatusOK)
+	apiURL := fmt.Sprintf("%s/repos/%s/issues/%d", githubAPIBase, repo, number)
+	payload, err := json.Marshal(map[string]any{"state": "closed"})
+	if err != nil {
+		return fmt.Errorf("marshal close payload: %w", err)
+	}
+	_, err = c.patchJSON(ctx, apiURL, payload, http.StatusOK)
 	return err
 }
 
 // HTTP helpers.
 
 func (c *IssueClient) getJSON(ctx context.Context, apiURL string) ([]byte, error) {
-	req, _ := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
 	c.setAuth(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s → %d: %s", apiURL, resp.StatusCode, string(body))
+		// Don't include response body in error — GitHub error responses
+		// are predictable (status text suffices), and avoiding body
+		// echoing means we can't accidentally leak Authorization-header
+		// reflections or rate-limit headers in error chains.
+		return nil, fmt.Errorf("GET %s → %d %s", apiURL, resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	return body, nil
 }
@@ -291,7 +325,10 @@ func (c *IssueClient) patchJSON(ctx context.Context, apiURL string, payload []by
 }
 
 func (c *IssueClient) bodyJSON(ctx context.Context, method, apiURL string, payload []byte, wantStatus int) ([]byte, error) {
-	req, _ := http.NewRequestWithContext(ctx, method, apiURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, method, apiURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	c.setAuth(req)
 	resp, err := c.HTTP.Do(req)
@@ -299,9 +336,13 @@ func (c *IssueClient) bodyJSON(ctx context.Context, method, apiURL string, paylo
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
 	if resp.StatusCode != wantStatus {
-		return nil, fmt.Errorf("%s %s → %d: %s", method, apiURL, resp.StatusCode, string(body))
+		// Same body-omission policy as getJSON above.
+		return nil, fmt.Errorf("%s %s → %d %s", method, apiURL, resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	return body, nil
 }
