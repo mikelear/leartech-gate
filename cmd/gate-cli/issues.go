@@ -116,15 +116,15 @@ func (o IssueOutcome) String() string {
 // but the caller logs and continues; gate verdict is not affected by
 // issue-API outcomes.
 //
-// One issue per service per repo. Title is version-agnostic
-// (`[leartech-gate] <service> blocking promotion to production`) so
-// the lifecycle survives version bumps — when the team fixes the
-// underlying bug + ships a new version, the same issue gets re-used:
-// updated body if still failing on the new version, auto-closed when
-// the new version passes. Body carries the current failing version +
-// reason for context.
+// One issue per service per repo PER CLUSTER. Title is version-agnostic
+// but cluster-suffixed (`[leartech-gate-<cluster>] <service> blocking
+// promotion to production`) so each cluster manages its own lifecycle
+// independently — without the suffix, GCP's PASS verdict could close
+// AZ's blocking issue (or vice-versa) when the same service genuinely
+// fails on only one cluster. Mirrors the verdict-comment marker pattern
+// (`<!-- leartech-gate-gcp -->`).
 //
-// State machine:
+// State machine (per cluster):
 //   - verdict.Pass  + no open issue → noop
 //   - verdict.Pass  + open issue    → close (auto-resolve)
 //   - !verdict.Pass + no open issue → create
@@ -132,7 +132,7 @@ func (o IssueOutcome) String() string {
 //     POSTs an update comment if reason or version changed)
 func (c *IssueClient) EnsureBlockingIssue(ctx context.Context, v ServiceVerdict) (IssueOutcome, error) {
 	repo := c.Owner + "/" + v.Service
-	titlePrefix := fmt.Sprintf("[leartech-gate] %s", v.Service)
+	titlePrefix := c.titlePrefixFor(v.Service)
 
 	existing, err := c.findOpenIssue(ctx, repo, titlePrefix)
 	if err != nil {
@@ -174,7 +174,12 @@ func (c *IssueClient) EnsureBlockingIssue(ctx context.Context, v ServiceVerdict)
 	// Existing issue — only post an update comment if the body
 	// (containing reason + version) actually changed. Skip noisy
 	// "still failing" updates when nothing's different from last run.
-	if strings.Contains(existing.Body, gateBodyMarker) &&
+	// Match either the cluster-suffixed marker (current bodies) or the
+	// legacy unsuffixed marker (bodies written by older gate-cli before
+	// per-cluster isolation landed).
+	hasMarker := strings.Contains(existing.Body, c.bodyMarkerFor()) ||
+		strings.Contains(existing.Body, gateBodyMarker)
+	if hasMarker &&
 		bodyReasonMatches(existing.Body, v.Reason) &&
 		strings.Contains(existing.Body, "@"+v.Version+"`") {
 		return IssueNoop, nil
@@ -194,14 +199,38 @@ func (c *IssueClient) EnsureBlockingIssue(ctx context.Context, v ServiceVerdict)
 	return IssueUpdated, nil
 }
 
-// gateBodyMarker is embedded in the issue body so future runs can detect
-// our prior content and compare reason without parsing markdown. Marker
-// includes the reason hash for idempotent comparison.
+// titlePrefixFor returns the per-cluster issue title prefix. Cluster
+// suffix isolates each cluster's lifecycle — without it, one cluster's
+// PASS verdict would close the other cluster's still-failing blocking
+// issue (verified failure mode 2026-05-10). Falls back to the legacy
+// suffix-less prefix when cluster is empty (older invocations / tests).
+func (c *IssueClient) titlePrefixFor(service string) string {
+	if c.Cluster == "" {
+		return fmt.Sprintf("[leartech-gate] %s", service)
+	}
+	return fmt.Sprintf("[leartech-gate-%s] %s", c.Cluster, service)
+}
+
+// bodyMarkerFor mirrors titlePrefixFor for the body marker — same
+// per-cluster isolation. Used by the idempotency check so a body
+// containing one cluster's marker isn't matched by the other cluster's
+// EnsureBlockingIssue call.
+func (c *IssueClient) bodyMarkerFor() string {
+	if c.Cluster == "" {
+		return "<!-- leartech-gate-blocking-issue -->"
+	}
+	return fmt.Sprintf("<!-- leartech-gate-blocking-issue-%s -->", c.Cluster)
+}
+
+// gateBodyMarker is the legacy cluster-agnostic marker — kept as a
+// constant so existing-issue migration logic can detect bodies created
+// by older gate-cli versions. New bodies use bodyMarkerFor() with the
+// cluster suffix.
 const gateBodyMarker = "<!-- leartech-gate-blocking-issue -->"
 
 func (c *IssueClient) renderIssueBody(v ServiceVerdict) string {
 	var b strings.Builder
-	fmt.Fprintln(&b, gateBodyMarker)
+	fmt.Fprintln(&b, c.bodyMarkerFor())
 	fmt.Fprintf(&b, "## :x: `%s@%s` is blocking promotion to production\n\n", v.Service, v.Version)
 	fmt.Fprintf(&b, "**Verdict reason:**\n\n> %s\n\n", v.Reason)
 	if len(v.FailedTests) > 0 {
