@@ -115,10 +115,11 @@ func TestBodyReasonMatches(t *testing.T) {
 // survives version bumps when teams fix bugs and ship the next
 // release. HasPrefix matches against both old and new title formats:
 //   - `[leartech-gate] leartech-auth-ui@0.0.36 blocking …` (legacy)
-//   - `[leartech-gate] leartech-auth-ui blocking …`        (current)
+//   - `[leartech-gate] leartech-auth-ui blocking …`        (legacy unsuffixed)
+//   - `[leartech-gate-gcp] leartech-auth-ui blocking …`    (current)
 func TestTitlePrefix_VersionAgnostic(t *testing.T) {
-	v := ServiceVerdict{Service: "leartech-auth-ui", Version: "0.0.37", Pass: false}
-	prefix := "[leartech-gate] " + v.Service
+	c := &IssueClient{}
+	prefix := c.titlePrefixFor("leartech-auth-ui")
 
 	legacyTitle := "[leartech-gate] leartech-auth-ui@0.0.36 blocking promotion to production"
 	currentTitle := "[leartech-gate] leartech-auth-ui blocking promotion to production"
@@ -132,6 +133,50 @@ func TestTitlePrefix_VersionAgnostic(t *testing.T) {
 	}
 	if strings.HasPrefix(otherTitle, prefix) {
 		t.Error("different service title should NOT match prefix")
+	}
+}
+
+// TestTitlePrefix_PerClusterIsolation locks the cross-cluster
+// non-interference contract. With cluster set, GCP's title prefix must
+// not match an AZ-created issue (and vice versa) — otherwise a passing
+// verdict on one cluster would close a still-failing issue on the other.
+func TestTitlePrefix_PerClusterIsolation(t *testing.T) {
+	gcp := &IssueClient{Cluster: "gcp"}
+	az := &IssueClient{Cluster: "az"}
+
+	gcpPrefix := gcp.titlePrefixFor("leartech-auth-ui")
+	azPrefix := az.titlePrefixFor("leartech-auth-ui")
+
+	if gcpPrefix == azPrefix {
+		t.Fatalf("per-cluster prefixes must differ — got %q for both", gcpPrefix)
+	}
+	if !strings.Contains(gcpPrefix, "gcp") {
+		t.Errorf("gcp prefix should embed cluster: %q", gcpPrefix)
+	}
+	if !strings.Contains(azPrefix, "az") {
+		t.Errorf("az prefix should embed cluster: %q", azPrefix)
+	}
+
+	// Critical: GCP's prefix must NOT match an AZ-titled issue.
+	azTitle := azPrefix + " blocking promotion to production"
+	if strings.HasPrefix(azTitle, gcpPrefix) {
+		t.Errorf("GCP prefix %q matched AZ title %q — would cross-close issues", gcpPrefix, azTitle)
+	}
+}
+
+// TestBodyMarker_PerCluster locks the same isolation for body markers
+// (used by the idempotency check).
+func TestBodyMarker_PerCluster(t *testing.T) {
+	gcp := &IssueClient{Cluster: "gcp"}
+	az := &IssueClient{Cluster: "az"}
+	if gcp.bodyMarkerFor() == az.bodyMarkerFor() {
+		t.Errorf("per-cluster body markers must differ")
+	}
+	// Empty cluster falls back to legacy marker so older bodies still
+	// match for migration.
+	legacy := &IssueClient{}
+	if legacy.bodyMarkerFor() != "<!-- leartech-gate-blocking-issue -->" {
+		t.Errorf("legacy fallback marker mismatch: %q", legacy.bodyMarkerFor())
 	}
 }
 
