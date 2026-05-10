@@ -13,15 +13,16 @@
 // No risk-driven override stiffening. Phase 1 hardening adds those.
 //
 // Required env (Tekton task supplies these):
-//   HELMFILE_PATH       — path to the helmfile to inspect
-//   QA_MANAGEMENT_RAW   — raw GitHub URL prefix for qa-management
-//                         (e.g. https://raw.githubusercontent.com/mikelear/leartech-qa-management/main)
-//   RESULT_STORE_BUCKET — GCS bucket name (e.g. test-artifacts-product-first)
-//   RESULT_STORE_PREFIX — GCS path prefix (e.g. results/v1/)
-//   CLUSTER_TAG         — gcp / az
-//   GITHUB_TOKEN        — for PR check + comment posting
-//   REPO_OWNER, REPO_NAME, PULL_NUMBER, PULL_PULL_SHA — Tekton injects these
-//   GCS_KEY_FILE        — path to GCS service-account key (mounted from secret)
+//
+//	HELMFILE_PATH       — path to the helmfile to inspect
+//	QA_MANAGEMENT_RAW   — raw GitHub URL prefix for qa-management
+//	                      (e.g. https://raw.githubusercontent.com/mikelear/leartech-qa-management/main)
+//	RESULT_STORE_BUCKET — GCS bucket name (e.g. test-artifacts-product-first)
+//	RESULT_STORE_PREFIX — GCS path prefix (e.g. results/v1/)
+//	CLUSTER_TAG         — gcp / az
+//	GITHUB_TOKEN        — for PR check + comment posting
+//	REPO_OWNER, REPO_NAME, PULL_NUMBER, PULL_PULL_SHA — Tekton injects these
+//	GCS_KEY_FILE        — path to GCS service-account key (mounted from secret)
 package main
 
 import (
@@ -88,12 +89,18 @@ type ResultJSON struct {
 
 // ServiceVerdict captures one service's gate evaluation.
 type ServiceVerdict struct {
-	Service       string
-	Version       string
-	Pass          bool
-	MissingTests  []string // tests that should exist but don't (no result-json in GCS)
-	FailedTests   []string // tests that exist but have status: Failure
-	Reason        string   // human-readable explanation
+	Service      string
+	Version      string
+	Pass         bool
+	MissingTests []string // tests that should exist but don't (no result-json in GCS)
+	FailedTests  []string // tests that exist but have status: Failure
+	Reason       string   // human-readable explanation
+
+	// FailedPacks is the structured form of FailedTests — pack names
+	// only, used to render per-pack artifact links (Playwright HTML
+	// report etc.) in the verdict comment. Populated alongside
+	// FailedTests in the post-deploy quill.
+	FailedPacks []string
 }
 
 func main() {
@@ -107,7 +114,21 @@ func main() {
 		watchNamespace   = flag.String("watch-namespace", envOr("WATCH_NAMESPACE", "jx-staging"), "namespace where Arrival CRs live")
 		enablePostDeploy = flag.Bool("enable-post-deploy-quill", envOr("ENABLE_POST_DEPLOY_QUILL", "true") == "true", "evaluate the post-deploy-tests quill against Arrival CRs")
 		kubeconfigPath   = flag.String("kubeconfig", envOr("KUBECONFIG", ""), "kubeconfig file (empty = in-cluster)")
-		_                = flag.Bool("help", false, "show this message")
+		// Post-deploy artifact path template — CONTRACT with arrivals-
+		// observer's chart paths.postDeployTemplate. Override only when
+		// the writer's template diverges (multi-tenant routing etc.).
+		postDeployPathTpl = flag.String("post-deploy-path-template", envOr(
+			"PATHS_POST_DEPLOY_TEMPLATE",
+			"results/v1/post-deploy/{{.Cluster}}/{{.Namespace}}/{{.Service}}/{{.Version}}/{{.Pack}}",
+		), "Go text/template for result-store paths; substituted with .Cluster/.Namespace/.Service/.Version/.Pack")
+		// Issue creation on service repos when their quill fails.
+		// Default off until validated (Tier 2 rollout). Once enabled,
+		// auto-creates / updates / closes blocking issues at
+		// {issue-repo-owner}/{service} so service owners see they're
+		// blocking promotion.
+		enableIssueCreation = flag.Bool("enable-issue-creation", envOr("ENABLE_ISSUE_CREATION", "false") == "true", "auto-open/update/close issues on service repos when their quill fails")
+		issueRepoOwner      = flag.String("issue-repo-owner", envOr("ISSUE_REPO_OWNER", "mikelear"), "GitHub org for service-repo issue creation")
+		_                   = flag.Bool("help", false, "show this message")
 	)
 	flag.Parse()
 
@@ -180,8 +201,10 @@ func main() {
 		}
 	}
 
-	// 3. Render verdict to stdout + (in real run) PR comment
-	body := renderVerdictMarkdown(verdicts, allPass)
+	// 3. Render verdict to stdout + (in real run) PR comment.
+	// Pass the path template + bucket so the renderer can append
+	// playwright-report links per failed UI test.
+	body := renderVerdictMarkdown(verdicts, allPass, *bucket, *postDeployPathTpl, *cluster, *watchNamespace)
 	fmt.Println(body)
 
 	if *dryRun {
@@ -192,8 +215,31 @@ func main() {
 		}
 	}
 
+	// 4. Auto-issue lifecycle on service repos. Best-effort — errors
+	// logged, never fail the gate. Skipped entirely when disabled or
+	// when the GitHub client can't be built.
+	if *enableIssueCreation && !*dryRun {
+		ic, err := NewIssueClient(*issueRepoOwner)
+		if err != nil {
+			logf("warn", "issue creation disabled — %v", err)
+		} else {
+			for _, v := range verdicts {
+				outcome, err := ic.EnsureBlockingIssue(ctx, v)
+				if err != nil {
+					logf("warn", "issue lifecycle for %s@%s: %v", v.Service, v.Version, err)
+					continue
+				}
+				if outcome != IssueNoop {
+					logf("info", "issue %s for %s@%s on %s/%s", outcome, v.Service, v.Version, *issueRepoOwner, v.Service)
+				}
+			}
+		}
+	}
+
 	if !allPass {
 		logf("info", "FAIL: at least one quill failed")
+		cancel() // explicit; os.Exit skips deferred cancel
+		//nolint:gocritic // intentional non-zero exit for Lighthouse; cancel() invoked above
 		os.Exit(1)
 	}
 	logf("info", "PASS: all quills green")
@@ -206,11 +252,11 @@ func main() {
 // both sandbox single-doc and JX3 multi-doc layouts without the caller
 // needing to know which.
 func parseHelmfile(path string) (*Helmfile, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // path comes from --helmfile flag (trusted operator input, not request data)
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	dec := yaml.NewDecoder(f)
 	var first Helmfile
 	for {
@@ -254,7 +300,7 @@ func evaluateShiftLeftQuill(ctx context.Context, qaMgmtRaw, bucket, prefix, clus
 		v.Reason = fmt.Sprintf("fetch %s: %v", url, err)
 		return v
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		// No required-tests entry for this service → not gated. Pass through.
@@ -313,7 +359,7 @@ func evaluateShiftLeftQuill(ctx context.Context, qaMgmtRaw, bucket, prefix, clus
 			v.MissingTests = append(v.MissingTests, t.Name)
 			continue
 		}
-		objResp.Body.Close()
+		_ = objResp.Body.Close()
 
 		if objResp.StatusCode == http.StatusNotFound {
 			v.Pass = false
@@ -335,7 +381,7 @@ func evaluateShiftLeftQuill(ctx context.Context, qaMgmtRaw, bucket, prefix, clus
 			continue
 		}
 		objBody, _ := io.ReadAll(objResp2.Body)
-		objResp2.Body.Close()
+		_ = objResp2.Body.Close()
 
 		var result ResultJSON
 		if err := json.Unmarshal(objBody, &result); err != nil {
@@ -365,7 +411,10 @@ func evaluateShiftLeftQuill(ctx context.Context, qaMgmtRaw, bucket, prefix, clus
 }
 
 // renderVerdictMarkdown produces the body of the PR sticky comment.
-func renderVerdictMarkdown(verdicts []ServiceVerdict, allPass bool) string {
+// bucket + pathTemplate are passed through so per-failed-pack artifact
+// links (Playwright HTML report) can be rendered inline. Empty bucket
+// or template ⇒ links are silently omitted.
+func renderVerdictMarkdown(verdicts []ServiceVerdict, allPass bool, bucket, pathTemplate, cluster, namespace string) string {
 	var b strings.Builder
 	if allPass {
 		b.WriteString("## :white_check_mark: leartech-gate: PASS\n\n")
@@ -379,12 +428,34 @@ func renderVerdictMarkdown(verdicts []ServiceVerdict, allPass bool) string {
 		if !v.Pass {
 			icon = ":x:"
 		}
-		b.WriteString(fmt.Sprintf("| `%s` | `%s` | %s | %s |\n", v.Service, v.Version, icon, v.Reason))
+		fmt.Fprintf(&b, "| `%s` | `%s` | %s | %s |\n", v.Service, v.Version, icon, v.Reason)
 		if len(v.MissingTests) > 0 {
-			b.WriteString(fmt.Sprintf("|  |  |  | Missing: `%s` |\n", strings.Join(v.MissingTests, "`, `")))
+			fmt.Fprintf(&b, "|  |  |  | Missing: `%s` |\n", strings.Join(v.MissingTests, "`, `"))
 		}
 		if len(v.FailedTests) > 0 {
-			b.WriteString(fmt.Sprintf("|  |  |  | Failed: `%s` |\n", strings.Join(v.FailedTests, "`, `")))
+			fmt.Fprintf(&b, "|  |  |  | Failed: `%s` |\n", strings.Join(v.FailedTests, "`, `"))
+		}
+		// Per-pack artifact links — one row per failed pack pointing at
+		// the playwright-report HTML index. Listing-URL added so engineers
+		// can grab a specific trace.zip for trace.playwright.dev viewing.
+		for _, pack := range v.FailedPacks {
+			prefix, err := renderPostDeployPathPrefix(pathTemplate, pathVars{
+				Cluster: cluster, Namespace: namespace,
+				Service: v.Service, Version: v.Version, Pack: pack,
+			})
+			if err != nil || prefix == "" {
+				continue
+			}
+			reportURL := renderPlaywrightReportURL(bucket, prefix)
+			listingURL := renderTestResultsListingURL(bucket, prefix)
+			if reportURL == "" {
+				continue
+			}
+			links := fmt.Sprintf("[HTML report](%s)", reportURL)
+			if listingURL != "" {
+				links += fmt.Sprintf(" · [trace.zip listing](%s)", listingURL)
+			}
+			fmt.Fprintf(&b, "|  |  |  | `%s` artifacts: %s |\n", pack, links)
 		}
 	}
 	b.WriteString("\nTo override: comment `/override leartech-gate` (Lighthouse plugin).\n")
@@ -407,18 +478,20 @@ func postPRCommentAndCheck(ctx context.Context, body string, pass bool, cluster 
 	marker := fmt.Sprintf("<!-- leartech-gate-%s -->", cluster)
 	stickyBody := marker + "\n" + body
 
-	// List existing comments; replace if our marker exists
+	// List existing comments; replace if our marker exists. URL built
+	// from trusted env (REPO_OWNER/REPO_NAME/PULL_NUMBER), not request
+	// data — gosec G704 SSRF taint warning is a false positive here.
 	listURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%s/comments", owner, name, pullNumber)
-	req, err := http.NewRequestWithContext(ctx, "GET", listURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", listURL, nil) //nolint:gosec // URL from trusted env
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "token "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req) //nolint:gosec // URL from trusted env
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 
 	type Comment struct {
@@ -441,32 +514,32 @@ func postPRCommentAndCheck(ctx context.Context, body string, pass bool, cluster 
 
 	if existingID != 0 {
 		patchURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/comments/%d", owner, name, existingID)
-		req, err := http.NewRequestWithContext(ctx, "PATCH", patchURL, strings.NewReader(string(payloadBytes)))
+		req, err := http.NewRequestWithContext(ctx, "PATCH", patchURL, strings.NewReader(string(payloadBytes))) //nolint:gosec // URL from trusted env
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Authorization", "token "+token)
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req) //nolint:gosec // URL from trusted env
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("PATCH comment %d returned status %d", existingID, resp.StatusCode)
 		}
 	} else {
-		req, err := http.NewRequestWithContext(ctx, "POST", listURL, strings.NewReader(string(payloadBytes)))
+		req, err := http.NewRequestWithContext(ctx, "POST", listURL, strings.NewReader(string(payloadBytes))) //nolint:gosec // URL from trusted env
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Authorization", "token "+token)
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req) //nolint:gosec // URL from trusted env
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("POST comment returned status %d", resp.StatusCode)
 		}
@@ -547,6 +620,7 @@ func evaluatePostDeployQuill(ctx context.Context, dyn dynamic.Interface, namespa
 			if st == "Failed" || st == "Timeout" {
 				name, _ := tm["name"].(string)
 				v.FailedTests = append(v.FailedTests, name+" ("+st+")")
+				v.FailedPacks = append(v.FailedPacks, name)
 			}
 		}
 	default: // Pending, Testing, ""
