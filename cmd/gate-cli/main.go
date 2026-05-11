@@ -109,7 +109,13 @@ func main() {
 		qaMgmtRaw        = flag.String("qa-management", envOr("QA_MANAGEMENT_RAW", "https://raw.githubusercontent.com/mikelear/leartech-qa-management/main"), "raw GitHub URL prefix for qa-management")
 		bucket           = flag.String("bucket", envOr("RESULT_STORE_BUCKET", "test-artifacts-product-first"), "GCS bucket name")
 		prefix           = flag.String("prefix", envOr("RESULT_STORE_PREFIX", "results/v1"), "GCS path prefix (no trailing slash)")
-		cluster          = flag.String("cluster", envOr("CLUSTER_TAG", "unknown"), "cluster tag (gcp/az)")
+		// Empty default (not "unknown") — when CLUSTER_TAG is unset,
+		// issues.go's titlePrefixFor / bodyMarkerFor fall back to the
+		// legacy cluster-less form (`[leartech-gate] <svc>`) which is the
+		// migration-friendly default. Sentinel "unknown" would produce
+		// ugly `[leartech-gate-unknown] <svc>` titles that don't match
+		// any cluster's lifecycle.
+		cluster          = flag.String("cluster", envOr("CLUSTER_TAG", ""), "cluster tag (gcp/az); empty ⇒ legacy unsuffixed issue titles")
 		dryRun           = flag.Bool("dry-run", false, "log decisions but don't post PR check")
 		watchNamespace   = flag.String("watch-namespace", envOr("WATCH_NAMESPACE", "jx-staging"), "namespace where Arrival CRs live")
 		enablePostDeploy = flag.Bool("enable-post-deploy-quill", envOr("ENABLE_POST_DEPLOY_QUILL", "true") == "true", "evaluate the post-deploy-tests quill against Arrival CRs")
