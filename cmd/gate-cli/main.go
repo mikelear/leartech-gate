@@ -105,10 +105,10 @@ type ServiceVerdict struct {
 
 func main() {
 	var (
-		helmfilePath     = flag.String("helmfile", envOr("HELMFILE_PATH", ""), "path to helmfile.yaml")
-		qaMgmtRaw        = flag.String("qa-management", envOr("QA_MANAGEMENT_RAW", "https://raw.githubusercontent.com/mikelear/leartech-qa-management/main"), "raw GitHub URL prefix for qa-management")
-		bucket           = flag.String("bucket", envOr("RESULT_STORE_BUCKET", "test-artifacts-product-first"), "GCS bucket name")
-		prefix           = flag.String("prefix", envOr("RESULT_STORE_PREFIX", "results/v1"), "GCS path prefix (no trailing slash)")
+		helmfilePath = flag.String("helmfile", envOr("HELMFILE_PATH", ""), "path to helmfile.yaml")
+		qaMgmtRaw    = flag.String("qa-management", envOr("QA_MANAGEMENT_RAW", "https://raw.githubusercontent.com/mikelear/leartech-qa-management/main"), "raw GitHub URL prefix for qa-management")
+		bucket       = flag.String("bucket", envOr("RESULT_STORE_BUCKET", "test-artifacts-product-first"), "GCS bucket name")
+		prefix       = flag.String("prefix", envOr("RESULT_STORE_PREFIX", "results/v1"), "GCS path prefix (no trailing slash)")
 		// Empty default (not "unknown") — when CLUSTER_TAG is unset,
 		// issues.go's titlePrefixFor / bodyMarkerFor fall back to the
 		// legacy cluster-less form (`[leartech-gate] <svc>`) which is the
