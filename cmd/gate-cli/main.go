@@ -1,22 +1,27 @@
 // Package main is the leartech-gate CLI invoked by Tekton on promotion PRs.
 //
 // Reads a helmfile that's been mutated by an auto-promotion (one or more
-// service version bumps), looks up each promoted service's required tests
-// in leartech-qa-management, and checks the result-store for matching
-// per-test result JSONs at the SHA-keyed GCS path. Aggregates verdict;
-// posts a PR check status + comment via GitHub API; exits 0 (pass) or
-// 1 (fail) so Lighthouse picks up the check.
+// service version bumps), evaluates each release against the post-deploy
+// quill (reads Arrival CRs in jx-staging), aggregates verdict, posts a
+// PR check status + sticky comment via GitHub API; exits 0 (pass) or 1
+// (fail) so Lighthouse picks up the check.
 //
-// Spike scope (Session 0 Step 6): one quill — shift-left-tests. No
-// beaver-lib helmfile diff parsing yet (uses simple yq-style yaml read of
-// the WHOLE helmfile rather than just the diff). No multi-quill framework.
-// No risk-driven override stiffening. Phase 1 hardening adds those.
+// Single quill today: post-deploy-tests (Arrival.phase=Passed contract).
+// Shift-left-tests quill was removed 2026-05-14 — release-time test
+// execution reinvented K8s readiness probes + post-deploy coverage
+// without genuine value-add. Real shift-left value (PR-time policy
+// gates: security scans must-have-passed, SBOM, license checks) needs
+// a different design + scope; deferred until a concrete compliance use
+// case exists.
+//
+// Future quills under consideration (see qa-architecture/gate.md):
+//   - copromotion: pure helmfile diff check, e.g. auth-ui + auth-service
+//     must promote together for OAuth handshake compat
+//   - migrations: K8s-native Helm hooks largely cover this, low value
 //
 // Required env (Tekton task supplies these):
 //
 //	HELMFILE_PATH       — path to the helmfile to inspect
-//	QA_MANAGEMENT_RAW   — raw GitHub URL prefix for qa-management
-//	                      (e.g. https://raw.githubusercontent.com/mikelear/leartech-qa-management/main)
 //	RESULT_STORE_BUCKET — GCS bucket name (e.g. test-artifacts-product-first)
 //	RESULT_STORE_PREFIX — GCS path prefix (e.g. results/v1/)
 //	CLUSTER_TAG         — gcp / az
@@ -59,21 +64,6 @@ type Release struct {
 	Version string `yaml:"version"`
 }
 
-// RequiredTests is qa-management's required-tests/<service>.yaml schema.
-type RequiredTests struct {
-	SchemaVersion string         `yaml:"schema_version"`
-	Service       string         `yaml:"service"`
-	Type          string         `yaml:"type"`
-	Required      []RequiredTest `yaml:"required_tests"`
-}
-
-type RequiredTest struct {
-	Name     string `yaml:"name"`
-	TestPack string `yaml:"test_pack"`
-	Blocking bool   `yaml:"blocking"`
-	Suite    string `yaml:"suite"`
-}
-
 // ResultJSON is the per-test result schema written by the end2end task.
 type ResultJSON struct {
 	SchemaVersion string `json:"schema_version"`
@@ -106,9 +96,11 @@ type ServiceVerdict struct {
 func main() {
 	var (
 		helmfilePath = flag.String("helmfile", envOr("HELMFILE_PATH", ""), "path to helmfile.yaml")
-		qaMgmtRaw    = flag.String("qa-management", envOr("QA_MANAGEMENT_RAW", "https://raw.githubusercontent.com/mikelear/leartech-qa-management/main"), "raw GitHub URL prefix for qa-management")
-		bucket       = flag.String("bucket", envOr("RESULT_STORE_BUCKET", "test-artifacts-product-first"), "GCS bucket name")
-		prefix       = flag.String("prefix", envOr("RESULT_STORE_PREFIX", "results/v1"), "GCS path prefix (no trailing slash)")
+		// --qa-management flag removed 2026-05-14 when the shift-left quill
+		// was dropped. Reinstate if/when a compliance/audit quill needs to
+		// fetch policy from qa-management at promotion time.
+		bucket = flag.String("bucket", envOr("RESULT_STORE_BUCKET", "test-artifacts-product-first"), "GCS bucket name")
+		prefix = flag.String("prefix", envOr("RESULT_STORE_PREFIX", "results/v1"), "GCS path prefix (no trailing slash)")
 		// Empty default (not "unknown") — when CLUSTER_TAG is unset,
 		// issues.go's titlePrefixFor / bodyMarkerFor fall back to the
 		// legacy cluster-less form (`[leartech-gate] <svc>`) which is the
@@ -163,8 +155,9 @@ func main() {
 
 	// Build dynamic K8s client for the post-deploy quill (Arrival CR reads).
 	// Best-effort — if it fails, post-deploy quill is skipped with a logged
-	// warning; shift-left still runs. Lets the gate degrade gracefully if
-	// the qa-gate task SA is misconfigured rather than failing every PR.
+	// warning and the gate effectively short-circuits to PASS (no quills
+	// running). Defensive degradation: misconfigured SA fails-loud at the
+	// next genuine failure rather than blocking every PR.
 	var dynClient dynamic.Interface
 	if *enablePostDeploy {
 		c, err := buildDynClient(*kubeconfigPath)
@@ -186,10 +179,19 @@ func main() {
 			logf("warn", "skipping release with empty name or version: %+v", rel)
 			continue
 		}
-		shift := evaluateShiftLeftQuill(ctx, *qaMgmtRaw, *bucket, *prefix, *cluster, rel)
-
-		merged := shift // start from shift-left's verdict
-		merged.Reason = fmt.Sprintf("shift-left: %s", shift.Reason)
+		// Post-deploy quill is the only quill today. Shift-left was
+		// removed 2026-05-14 — its release-time test-execution design
+		// reinvented K8s readiness probes + post-deploy quill coverage
+		// without genuine value-add. Real shift-left value (PR-time
+		// policy/audit: security scans, SBOM, license checks must-have-
+		// passed) would need a different design + scope — defer until
+		// there's a concrete compliance use case.
+		merged := ServiceVerdict{
+			Service: rel.Name,
+			Version: rel.Version,
+			Pass:    true,
+			Reason:  "no required-tests entry in qa-management; not gated",
+		}
 
 		if *enablePostDeploy && dynClient != nil {
 			pd := evaluatePostDeployQuill(ctx, dynClient, *watchNamespace, rel)
@@ -282,138 +284,6 @@ func parseHelmfile(path string) (*Helmfile, error) {
 		}
 	}
 	return &first, nil
-}
-
-// evaluateShiftLeftQuill runs the single quill for one release.
-func evaluateShiftLeftQuill(ctx context.Context, qaMgmtRaw, bucket, prefix, cluster string, rel Release) ServiceVerdict {
-	v := ServiceVerdict{
-		Service: rel.Name,
-		Version: rel.Version,
-		Pass:    true, // optimistic
-	}
-
-	// 1. Fetch required-tests/<service>.yaml from qa-management
-	url := fmt.Sprintf("%s/required-tests/%s.yaml", strings.TrimRight(qaMgmtRaw, "/"), rel.Name)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		v.Pass = false
-		v.Reason = fmt.Sprintf("could not build request for %s: %v", url, err)
-		return v
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		v.Pass = false
-		v.Reason = fmt.Sprintf("fetch %s: %v", url, err)
-		return v
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotFound {
-		// No required-tests entry for this service → not gated. Pass through.
-		v.Reason = "no required-tests entry in qa-management; not gated"
-		return v
-	}
-	if resp.StatusCode != http.StatusOK {
-		v.Pass = false
-		v.Reason = fmt.Sprintf("fetch %s returned status %d", url, resp.StatusCode)
-		return v
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		v.Pass = false
-		v.Reason = fmt.Sprintf("read response body: %v", err)
-		return v
-	}
-
-	var rt RequiredTests
-	if err := yaml.Unmarshal(body, &rt); err != nil {
-		v.Pass = false
-		v.Reason = fmt.Sprintf("parse required-tests yaml: %v", err)
-		return v
-	}
-
-	if len(rt.Required) == 0 {
-		v.Reason = "qa-management entry exists but no required tests declared; not gated"
-		return v
-	}
-
-	// 2. For each required test, GCS-fetch the per-test result JSON
-	// Path: gs://<bucket>/<prefix>/<repo>/<sha>/<cluster>/<test_pack>/<test_name>.json
-	// We use HTTPS GCS endpoint; relies on bucket being publicly readable for the spike.
-	// Phase 1 hardening adds authenticated reads via service-account key.
-	for _, t := range rt.Required {
-		objURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s/%s/%s/%s/%s/%s.json",
-			bucket,
-			strings.TrimRight(prefix, "/"),
-			rel.Name,
-			rel.Version,
-			cluster,
-			t.TestPack,
-			t.Name,
-		)
-		objReq, err := http.NewRequestWithContext(ctx, "GET", objURL, nil)
-		if err != nil {
-			v.Pass = false
-			v.MissingTests = append(v.MissingTests, t.Name)
-			v.Reason = fmt.Sprintf("internal: build object request: %v", err)
-			continue
-		}
-		objResp, err := http.DefaultClient.Do(objReq)
-		if err != nil {
-			v.Pass = false
-			v.MissingTests = append(v.MissingTests, t.Name)
-			continue
-		}
-		_ = objResp.Body.Close()
-
-		if objResp.StatusCode == http.StatusNotFound {
-			v.Pass = false
-			v.MissingTests = append(v.MissingTests, t.Name)
-			continue
-		}
-		if objResp.StatusCode != http.StatusOK {
-			v.Pass = false
-			v.MissingTests = append(v.MissingTests, t.Name)
-			continue
-		}
-
-		// Re-do with body to parse status
-		objReq2, _ := http.NewRequestWithContext(ctx, "GET", objURL, nil)
-		objResp2, err := http.DefaultClient.Do(objReq2)
-		if err != nil {
-			v.Pass = false
-			v.MissingTests = append(v.MissingTests, t.Name)
-			continue
-		}
-		objBody, _ := io.ReadAll(objResp2.Body)
-		_ = objResp2.Body.Close()
-
-		var result ResultJSON
-		if err := json.Unmarshal(objBody, &result); err != nil {
-			v.Pass = false
-			v.FailedTests = append(v.FailedTests, t.Name+" (malformed JSON)")
-			continue
-		}
-		if result.Status != "Success" {
-			v.Pass = false
-			v.FailedTests = append(v.FailedTests, fmt.Sprintf("%s (status=%s)", t.Name, result.Status))
-		}
-	}
-
-	if v.Pass {
-		v.Reason = fmt.Sprintf("%d required tests passed", len(rt.Required))
-	} else {
-		parts := []string{}
-		if len(v.MissingTests) > 0 {
-			parts = append(parts, fmt.Sprintf("%d missing", len(v.MissingTests)))
-		}
-		if len(v.FailedTests) > 0 {
-			parts = append(parts, fmt.Sprintf("%d failed", len(v.FailedTests)))
-		}
-		v.Reason = strings.Join(parts, ", ")
-	}
-	return v
 }
 
 // renderVerdictMarkdown produces the body of the PR sticky comment.
