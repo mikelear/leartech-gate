@@ -95,7 +95,12 @@ func main() {
 		dryRun           = flag.Bool("dry-run", false, "log decisions but don't post PR check")
 		watchNamespace   = flag.String("watch-namespace", envOr("WATCH_NAMESPACE", "jx-staging"), "namespace where Arrival CRs live")
 		enablePostDeploy = flag.Bool("enable-post-deploy-quill", envOr("ENABLE_POST_DEPLOY_QUILL", "true") == "true", "evaluate the post-deploy-tests quill against Arrival CRs")
-		kubeconfigPath   = flag.String("kubeconfig", envOr("KUBECONFIG", ""), "kubeconfig file (empty = in-cluster)")
+		// Layer 1 duration-regression check — reads results.json from
+		// post-deploy GCS path, compares per-test duration_ms vs the
+		// previous arrival's results.json. Default off until validated
+		// end-to-end (Tier-2 demo cycle).
+		enableDurationQuill = flag.Bool("enable-duration-quill", envOr("ENABLE_DURATION_QUILL", "false") == "true", "evaluate the Layer 1 duration-regression quill against results.json")
+		kubeconfigPath      = flag.String("kubeconfig", envOr("KUBECONFIG", ""), "kubeconfig file (empty = in-cluster)")
 		// Post-deploy artifact path template — CONTRACT with arrivals-
 		// observer's chart paths.postDeployTemplate. Override only when
 		// the writer's template diverges (multi-tenant routing etc.).
@@ -181,6 +186,22 @@ func main() {
 				merged.Pass = false
 				merged.MissingTests = append(merged.MissingTests, pd.MissingTests...)
 				merged.FailedTests = append(merged.FailedTests, pd.FailedTests...)
+			}
+		}
+
+		// Layer 1 — per-test duration regression. Runs independently of
+		// post-deploy: even when phase=Passed, a quietly-slower test
+		// surfaces here. http.DefaultClient is fine; bucket is public.
+		if *enableDurationQuill && dynClient != nil {
+			dq := evaluateDurationRegressionQuill(
+				ctx, dynClient, http.DefaultClient,
+				*bucket, *postDeployPathTpl, *cluster, *watchNamespace, rel,
+			)
+			merged.Reason = merged.Reason + "; layer1: " + dq.Reason
+			if !dq.Pass {
+				merged.Pass = false
+				merged.FailedTests = append(merged.FailedTests, dq.FailedTests...)
+				merged.FailedPacks = append(merged.FailedPacks, dq.FailedPacks...)
 			}
 		}
 
