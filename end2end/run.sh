@@ -50,10 +50,9 @@ else
   for script in "${scripts[@]}"; do
     # Strip the leading [0-9][0-9]- ordering prefix so the test name in
     # results.json is the human-readable identity (e.g. `smoke`), not the
-    # incidental "alphabetical position" (e.g. `01-smoke`). The gate's
-    # required-tests config (qa-management/required-tests/<service>.yaml)
-    # references tests by the prefix-stripped name. Renumbering scripts
-    # (01- → 04-) must not break the gate.
+    # incidental "alphabetical position" (e.g. `01-smoke`). Renumbering
+    # scripts (01- → 04-) must not break downstream consumers that key
+    # on the test name.
     name=$(basename "$script" .sh | sed 's/^[0-9][0-9]-//')
     log="$SCRIPT_DIR/$name.log"
     echo "[end2end] running $name"
