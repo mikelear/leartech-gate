@@ -10,7 +10,7 @@ func TestRenderIssueBody_PassThroughVerdict(t *testing.T) {
 	v := ServiceVerdict{
 		Service: "leartech-auth-ui", Version: "0.0.36",
 		Pass:        false,
-		Reason:      "shift-left: no required-tests entry; post-deploy: Arrival.phase=Failed",
+		Reason:      "post-deploy: Arrival.phase=Failed",
 		FailedTests: []string{"end2end-ui (Failed)"},
 		FailedPacks: []string{"end2end-ui"},
 	}

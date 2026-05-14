@@ -64,19 +64,6 @@ type Release struct {
 	Version string `yaml:"version"`
 }
 
-// ResultJSON is the per-test result schema written by the end2end task.
-type ResultJSON struct {
-	SchemaVersion string `json:"schema_version"`
-	SHA           string `json:"sha"`
-	Repo          string `json:"repo"`
-	Cluster       string `json:"cluster"`
-	TestName      string `json:"test_name"`
-	TestPack      string `json:"test_pack"`
-	Status        string `json:"status"`
-	DurationMS    int    `json:"duration_ms"`
-	Message       string `json:"message"`
-}
-
 // ServiceVerdict captures one service's gate evaluation.
 type ServiceVerdict struct {
 	Service      string
@@ -96,11 +83,8 @@ type ServiceVerdict struct {
 func main() {
 	var (
 		helmfilePath = flag.String("helmfile", envOr("HELMFILE_PATH", ""), "path to helmfile.yaml")
-		// --qa-management flag removed 2026-05-14 when the shift-left quill
-		// was dropped. Reinstate if/when a compliance/audit quill needs to
-		// fetch policy from qa-management at promotion time.
-		bucket = flag.String("bucket", envOr("RESULT_STORE_BUCKET", "test-artifacts-product-first"), "GCS bucket name")
-		prefix = flag.String("prefix", envOr("RESULT_STORE_PREFIX", "results/v1"), "GCS path prefix (no trailing slash)")
+		bucket       = flag.String("bucket", envOr("RESULT_STORE_BUCKET", "test-artifacts-product-first"), "GCS bucket name")
+		prefix       = flag.String("prefix", envOr("RESULT_STORE_PREFIX", "results/v1"), "GCS path prefix (no trailing slash)")
 		// Empty default (not "unknown") — when CLUSTER_TAG is unset,
 		// issues.go's titlePrefixFor / bodyMarkerFor fall back to the
 		// legacy cluster-less form (`[leartech-gate] <svc>`) which is the
@@ -179,23 +163,20 @@ func main() {
 			logf("warn", "skipping release with empty name or version: %+v", rel)
 			continue
 		}
-		// Post-deploy quill is the only quill today. Shift-left was
-		// removed 2026-05-14 — its release-time test-execution design
-		// reinvented K8s readiness probes + post-deploy quill coverage
-		// without genuine value-add. Real shift-left value (PR-time
-		// policy/audit: security scans, SBOM, license checks must-have-
-		// passed) would need a different design + scope — defer until
-		// there's a concrete compliance use case.
+		// Post-deploy is currently the only quill. Shift-left was removed
+		// 2026-05-14 (release-time test execution duplicated K8s readiness
+		// probes + post-deploy coverage). Future quills (copromotion,
+		// security-attestation) land here as additional evaluators.
 		merged := ServiceVerdict{
 			Service: rel.Name,
 			Version: rel.Version,
 			Pass:    true,
-			Reason:  "no required-tests entry in qa-management; not gated",
+			Reason:  "no quills enabled",
 		}
 
 		if *enablePostDeploy && dynClient != nil {
 			pd := evaluatePostDeployQuill(ctx, dynClient, *watchNamespace, rel)
-			merged.Reason = merged.Reason + "; post-deploy: " + pd.Reason
+			merged.Reason = "post-deploy: " + pd.Reason
 			if !pd.Pass {
 				merged.Pass = false
 				merged.MissingTests = append(merged.MissingTests, pd.MissingTests...)
