@@ -19,8 +19,11 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/swaggest/swgui/v3cdn"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/mikelear/leartech-go-common/pkg/tracing"
 
 	"github.com/mikelear/leartech-gate/internal/config"
 	"github.com/mikelear/leartech-gate/internal/db"
@@ -69,6 +72,22 @@ func run() error {
 		Str("port", cfg.Port).
 		Msg("starting leartech-gate")
 
+	// Tracing: emits spans to Tempo via OTLP-HTTP. Pre-warms exporter
+	// during Init so first real request doesn't race cold-start (see
+	// leartech-go-common/pkg/tracing + qa-architecture/tier-2-demo.md
+	// Finding #5). Server was untraced before Phase 3 of #129.
+	shutdownTracer, err := tracing.Init(ctx, "leartech-gate", version, cfg.ClusterID)
+	if err != nil {
+		return fmt.Errorf("init tracing: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracer(shutdownCtx); err != nil {
+			log.Warn().Err(err).Msg("tracer shutdown failed")
+		}
+	}()
+
 	// Shell mode: if DATABASE_URL is empty the service runs without a DB —
 	// `/health/ready`, `/docs`, `/openapi.json`, `/metrics` all still respond so
 	// the template's own staging deploy can prove the chain end-to-end without
@@ -88,6 +107,7 @@ func run() error {
 
 	router := gin.New()
 	router.Use(gin.Recovery())
+	router.Use(otelgin.Middleware("leartech-gate"))
 	router.Use(middleware.RequestLogger())
 
 	// Health endpoints — unauthenticated per golden-standard contract.
