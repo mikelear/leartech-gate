@@ -189,20 +189,33 @@ func main() {
 			}
 		}
 
-		// Layer 1 — per-test duration regression. Runs independently of
-		// post-deploy: even when phase=Passed, a quietly-slower test
-		// surfaces here. http.DefaultClient is fine; bucket is public.
+		// Layer 1 — per-test duration regression. INFORMATIONAL ONLY
+		// (2026-05-19): duration regressions are an observability
+		// concern (forensics' job, not gate's). Reasons for the demote:
+		// - Baseline picker uses "previous Arrival" without skipping
+		//   Failed/Timeout/failed-fast runs. A previously-broken test
+		//   that bailed at 159ms becomes the baseline for the next
+		//   (now-passing) version's real 2s flow, looking like a 13×
+		//   regression and blocking the FIX.
+		// - Blocking on duration prevents shipping the fix for a
+		//   regression that's already in production. The next promotion
+		//   may be the resolution; blocking it is perverse.
+		// - Wrong-service-blame: rust-template's fleet-test slows down
+		//   because go-template (a peer) regressed, but the *rust*
+		//   promotion gets blocked.
+		// Reason annotation kept so engineers still see the layer1 verdict
+		// in the PR comment (observability value). Issue-opening for
+		// real regressions moves to forensics-runner (#152). Re-enabling
+		// blocking would need: baseline-picker skips Failed runs +
+		// peer-aware blame attribution.
 		if *enableDurationQuill && dynClient != nil {
 			dq := evaluateDurationRegressionQuill(
 				ctx, dynClient, http.DefaultClient,
 				*bucket, *postDeployPathTpl, *cluster, *watchNamespace, rel,
 			)
 			merged.Reason = merged.Reason + "; layer1: " + dq.Reason
-			if !dq.Pass {
-				merged.Pass = false
-				merged.FailedTests = append(merged.FailedTests, dq.FailedTests...)
-				merged.FailedPacks = append(merged.FailedPacks, dq.FailedPacks...)
-			}
+			// Deliberately do NOT propagate dq.Pass/FailedTests/FailedPacks
+			// to merged — Layer 1 is informational. See block comment above.
 		}
 
 		verdicts = append(verdicts, merged)
