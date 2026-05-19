@@ -1,153 +1,57 @@
 # leartech-gate — Claude Context
 
-Golden Go HTTP service template. Clone-and-rename starter for new
-Leartech Go services, fully wired into a Jenkins X / Lighthouse
-multi-cluster CI/CD chain.
+QA gate service for leartech promotion PRs. Porcupine-equivalent — Tekton presubmit on GitOps repos. Reads `leartech-qa-management` for required-tests + quill config, reads result-store for verdicts, posts PR check status + sticky comment.
 
-## Bootstrap a new service with Claude
+> **Important: not the Go template.** Despite this repo originally being cloned from the canonical template, it is no longer it. If a session reaches this CLAUDE.md while looking for the golden Go service template to clone for a new service, **stop and clone `mikelear/leartech-go-service-template` instead** — the hub status file (`~/leartech/hub/status/leartech-go-service-template.md`) is the source of truth on "which repo is the template". Authoritative bootstrap snippet lives in `~/leartech/hub/shared-rules/multi-cluster-jx3-pattern.md` § "Bootstrap for a new service". The hub rule that governs this is `~/leartech/hub/shared-rules/repo-identity-resolution.md`.
 
-Open Claude Code (or any capable coding agent) in a fresh clone of this
-repo and feed it this prompt:
+## Hub status (loaded automatically when present)
 
-> Rename this template from `leartech-gate` to
-> `leartech-<my-service>`. Touch `go.mod`, `Makefile`, `README.md`,
-> `charts/**/*.yaml`, `preview/helmfile.yaml.gotmpl`,
-> `.lighthouse/jenkins-x/*.yaml`, `cmd/server/main.go`'s swagger
-> annotations, and `.golangci.yml`'s `goimports.local-prefixes`.
-> Then seed a `v0.0.1` git tag and update `renovate.json`'s
-> `matchPackageNames` if the go-runtime base image needs tracking.
-> Leave the `.lighthouse/jenkins-x/*` files' `uses:` references
-> pointing at `mikelear/leartech-pipeline-catalog` unchanged — those
-> are shared.
+QA gate runtime/architecture state is aggregated into `~/leartech/hub/status/qa-architecture.md` + `~/leartech/hub/status/qa-analysis.md` rather than having a dedicated `leartech-gate.md` file today. Read both before significant changes here.
 
-Claude should be able to complete the rename in one pass by grepping
-for `leartech-gate` and substituting. For Go, also update
-the module path in every `.go` file's `github.com/mikelear/leartech-gate/...` imports.
+## What the binaries are
 
-After rename, run:
+- **`cmd/gate-cli/`** — the gate logic. Invoked by Tekton on each PR opened against `mikelear/jx-build-cluster-gsm` or `mikelear/jx-build-cluster-akv`. Header comment in `main.go` is the authoritative env-contract and verdict logic.
+- **`cmd/server/`** — minimal HTTP stub kept because the chart expects a long-running deployable. No public API. Exposes only `/health/live`, `/health/ready`, `/openapi.json` (empty-ish), `/docs`. Not a service consumers should generate clients against — `release.yaml` deliberately does NOT run the openapi-generation task.
 
-```bash
-go mod tidy
-git tag -fa v0.0.1 -m "bootstrap: seed for jx-release-version"
-git push origin main v0.0.1
-```
+## Conventions in this repo
 
-Register the repo on each Lighthouse cluster's gitops source-config
-(see **Cluster prerequisites** below), push a trivial PR, and the
-full 11-check presubmit chain fires.
+- The cmd/server stub keeps the spine of a Golden Service so `leartech-helm-library` and the catalog tasks keep working, but it is not the work — don't add real handlers there; add them to cmd/gate-cli or carve out a new cmd.
+- Tests live under `cmd/gate-cli/*_test.go` and `internal/`. Coverage threshold is tracked in `.lighthouse/jenkins-x/test.yaml`.
+- swag annotations stay minimal — there's nothing real to document yet, and codegen is intentionally off.
+- Pipeline yaml is thin `uses:` over `mikelear/leartech-pipeline-catalog`. Do not inline pipeline logic.
 
 ## Repo layout
 
 | Path | Purpose |
 |---|---|
-| `cmd/server/main.go` | Entry point with swaggo annotations (`@title`, `@version`, `@securityDefinitions`) |
-| `internal/{config,handlers,middleware,db}/` | Standard service internals — gin router, health handlers, auth middleware, pgx pool |
-| `docs/` | swag-generated OpenAPI spec (regenerated on `make swag`) — served at `/openapi.json` |
-| `migrations/` | goose SQL migrations run as Helm post-install Job |
-| `Dockerfile` | Multi-stage: `ghcr.io/mikelear/leartech-go-runtime` build → `gcr.io/distroless/static-debian12:nonroot` runtime |
-| `Makefile` | Slim — `swag`, `lint`, `build`, `test`, `test-coverage` (6 targets total) |
-| `.golangci.yml` | Thin override — base config is fetched from catalog at CI time |
-| `charts/leartech-gate/` | Helm chart with `leartech-helm-library` dependency |
-| `preview/` | Per-PR preview helmfile (env-templated URLs) |
-| `end2end/run.sh` + `end2end/01-smoke.sh` | Smoke tests run by shared end2end Tekton task |
-| `.lighthouse/jenkins-x/` | 11-trigger presubmit + release suite (thin `uses:` wrappers) |
-| `renovate.json` | Dependency bump automation (patch auto-merge, leartech-go-runtime auto-merge) |
+| `cmd/gate-cli/` | The gate CLI (the real work) |
+| `cmd/server/` | Minimal HTTP stub for chart deployability |
+| `internal/{config,handlers,middleware,db,tracing}/` | Standard Golden Service internals — kept up-to-date with the canonical template to maintain spine consistency |
+| `migrations/` | goose SQL migrations run as Helm post-install Job (currently a placeholder) |
+| `Dockerfile` | Multi-stage build for BOTH `cmd/server` AND `cmd/gate-cli` |
+| `Makefile` | swag + lint + build + test targets |
+| `charts/leartech-gate/` | Helm chart using `leartech-helm-library` |
+| `preview/` | Per-PR preview helmfile |
+| `end2end/` | Smoke + fleet-test scripts (mirror of golden template's set) |
+| `.lighthouse/jenkins-x/` | Standard 11-trigger presubmit + release suite, minus codegen on release |
+| `renovate.json` | Dependency bump automation |
 
 ## Pipeline triggers
 
-All 11 checks below are thin wrappers over
-[mikelear/leartech-pipeline-catalog](https://github.com/mikelear/leartech-pipeline-catalog)
-tasks. Zero pipeline logic lives in this repo.
-
-| Check | Catalog source |
-|---|---|
-| `pr` | `tasks/go/pullrequest.yaml` — go build + kaniko + jx-preview |
-| `lint` | `tasks/go-lint/pullrequest.yaml` — golangci-lint with centralised base config (yq-merged at CI time) |
-| `test` | `tasks/go-test/pullrequest.yaml` — `go test -race -coverprofile` + coverage sticky comment |
-| `govulncheck` | `tasks/govulncheck/pullrequest.yaml` — Go dep vulnerability scan |
-| `security-scan` | `tasks/security-scan/pullrequest.yaml` — gitleaks + semgrep + grype |
-| `image-scan` | `tasks/security-scan/image-scan.yaml` |
-| `dynamic-scan` | `tasks/security-scan/dynamic/pullrequest.yaml` — nmap + egress-isolation |
-| `ai-review` | `tasks/ai-review/pullrequest.yaml` — multi-LLM code review |
-| `ai-feedback` | `tasks/ai-review/feedback.yaml` — comment-triggered on `/ai-feedback` |
-| `end2end` | `tasks/end2end/pullrequest.yaml` — runs this repo's `end2end/run.sh` |
-| `release` (postsubmit) | `tasks/go/release.yaml` — cluster-suffixed tag, cosign, helm-release, jx-promote |
-
-## Runtime base
-
-Build stage: `ghcr.io/mikelear/leartech-go-runtime:X` — pre-installs
-`git`, `make`, `swag`, `ca-certificates` on `golang:1.25-alpine`.
-Runtime stage: `gcr.io/distroless/static-debian12:nonroot` — no shell,
-no package manager, uid 65532.
-
-**Distroless nonroot CWD is `/home/nonroot`**, not `/`. Use absolute
-paths in `c.File(...)` and similar — a relative path like
-`"docs/swagger.json"` resolves against `/home/nonroot/...` and misses.
-The Dockerfile does `COPY --chown=65532:65532 /docs /docs` so nonroot
-can read the generated OpenAPI spec.
+Same 11-check chain as any leartech Go service — `pr`, `lint`, `test`, `govulncheck`, `security-scan`, `image-scan`, `dynamic-scan`, `ai-review`, `ai-feedback`, `end2end`, plus `release` postsubmit. Wrappers over [`mikelear/leartech-pipeline-catalog`](https://github.com/mikelear/leartech-pipeline-catalog).
 
 ## Cluster prerequisites
 
-Before pipelines fire on a new clone:
-
-1. **Register** the repo in each Lighthouse cluster's gitops source-config:
-   `.jx/gitops/source-config.yaml` → add `- name: leartech-<my-service>` under the `mikelear/` group.
-2. **`jx-cluster-config` ConfigMap** in each cluster's `jx` namespace with `CLUSTER_ID: gcp` or `CLUSTER_ID: az` so release pipelines know which cluster-suffixed tag to push.
-3. **Container registry access**: Kaniko pushes to `$PUSH_CONTAINER_REGISTRY/$DOCKER_REGISTRY_ORG/<app>:$VERSION`. tekton-bot needs push creds.
-4. **`ghcr.io` visibility**: on first publish, the container package is private by default — flip to Public so Kaniko on other clusters can pull it.
-5. **`cosign-keys` secret** in `jx` namespace holding `cosign.key` for image signing.
+This repo is already registered with both clusters and cluster prereqs are satisfied — see `~/leartech/hub/CLAUDE.md` § "Registering a new repo with JX" for the reference pattern (which applies to *new* repos, not this one).
 
 ## Release mechanics
 
-- `jx-release-version --previous-version from-tag > VERSION` with custom cluster-suffix logic in `tasks/release/next-version.yaml` — prevents GCP/Azure races on parallel releases.
-- Bootstrap: seed `v0.0.1` before the first automated release.
-- Git tag is cluster-suffixed: `v0.1.0-gcp` / `v0.1.0-az`.
-- Image tag is plain `$VERSION` (per-cluster registries don't race).
-- Cosign signs the cluster-registry image (+ ghcr.io tag).
-- `jx promote` opens the auto-PR on each cluster's gitops repo.
-- Codegen task (sibling to `from-build-pack`, `runAfter`) generates
-  client SDKs in angular/typescript/go/python. AZ publishes,
-  GCP skips via the catalog's single-publisher gate. This template's
-  release exercises the full chain on every push, acting as the catalog's
-  canary — if codegen breaks, the template's release fails before any
-  consumer notices.
-
-## Codegen / OpenAPI spec
-
-- `cmd/server/main.go` carries the `@title` / `@version` / `@description`
-  / `@license` / `@securityDefinitions` annotations (use single-space
-  separator: `// @title ...`, NOT tab — swag silently drops tab-separated
-  annotations and the spec ships with empty `info{}`).
-- `internal/handlers/*.go` carry per-endpoint annotations (`@Summary`,
-  `@Tags`, `@Router`, `@Success`, etc.).
-- Run `make swag` after changing annotations and commit the regenerated
-  `docs/{docs.go,swagger.json,swagger.yaml}` — the codegen task can't
-  see the build pod's regenerated copy (separate git-clone).
-- Published packages (visible in your fork after first release):
-  `@<org>/<repo>-{angular,typescript}` on npm GitHub Packages,
-  `<org>/leartech-{go,py}-packages/<repo>` mono-repo subdirs.
-
-## Iteration mechanics
-
-Commit directly to `main` on this repo — it's a template, there's no
-prod to break. Exercise pipeline changes via PRs opened **from a
-consumer repo** that clones this template.
+Standard multi-cluster JX3 pattern — `jx-release-version --previous-version from-tag`, cluster-suffixed tags (`v0.X.Y-gcp` / `v0.X.Y-az`), cosign-signed image, jx-promote auto-PRs. The codegen sibling task is intentionally absent from `release.yaml` — no public API surface to generate clients against. See `~/leartech/hub/shared-rules/multi-cluster-jx3-pattern.md`.
 
 ## Dependencies
 
 - [`mikelear/leartech-pipeline-catalog`](https://github.com/mikelear/leartech-pipeline-catalog) — Tekton task catalog
-- [`mikelear/leartech-dockerfiles`](https://github.com/mikelear/leartech-dockerfiles) — `leartech-go-runtime` base image source
-- `ghcr.io/mikelear/leartech-go-runtime` — build-stage base (cosign-signed, weekly rebuild)
-- `leartech-go-common` — shared auth middleware, slog setup, pgx pool builder
-- `leartech-helm-library` — shared chart helpers (published to each cluster's OCI chart registry)
-- Jenkins X / Lighthouse + Tekton installed on each target cluster
-
-## Running the chain elsewhere
-
-If you're forking this to a new org, the bill-of-materials is:
-
-1. Fork or rebuild `leartech-dockerfiles` (for `leartech-go-runtime`)
-2. Fork `leartech-pipeline-catalog` and adjust `uses:` references in this template's `.lighthouse/jenkins-x/*.yaml` to point at your fork
-3. Fork `leartech-helm-library` and `leartech-go-common` (adjust references)
-4. Update every `mikelear/...` reference in this template to `<your-org>/...`
-5. Ensure Jenkins X is installed on your cluster(s) with Lighthouse + Tekton
+- [`mikelear/leartech-qa-management`](https://github.com/mikelear/leartech-qa-management) — required-tests + quill config (Renovate-pinned)
+- [`mikelear/leartech-arrivals-observer`](https://github.com/mikelear/leartech-arrivals-observer) — creates the Arrival CRs the gate reads
+- `ghcr.io/mikelear/leartech-go-runtime` — build-stage base image
+- `leartech-go-common`, `leartech-helm-library` — standard leartech foundations
