@@ -492,7 +492,18 @@ func evaluatePostDeployQuill(ctx context.Context, dyn dynamic.Interface, namespa
 	// different namespaces, etc.), prefer the most-recent finalized one;
 	// fall back to the most-recent in-progress one.
 	arr := pickLatestArrival(list.Items)
-	phase, _, _ := unstructured.NestedString(arr.Object, "status", "phase")
+	phase := arrivalPhaseOf(arr)
+
+	// An in-flight arrival (Testing/Pending/"") means the deploy landed BEFORE
+	// its post-deploy test finished — a timing race, not a failure. Instant-
+	// failing here false-reds the gate and blocks the release until it's re-run
+	// (observed 2026-07-07: auth-admin-ui 0.0.12 red while mid-test, green
+	// minutes later). So wait, bounded, for it to finalize. Runs on its own
+	// context so the fast-path 60s timeout doesn't cut the wait short.
+	if isInFlightPhase(phase) {
+		arr, phase = awaitArrivalFinal(dyn, namespace, selector, arr)
+	}
+
 	switch phase {
 	case "Passed":
 		v.Reason = "Arrival.phase=Passed"
@@ -514,9 +525,9 @@ func evaluatePostDeployQuill(ctx context.Context, dyn dynamic.Interface, namespa
 				v.FailedPacks = append(v.FailedPacks, name)
 			}
 		}
-	default: // Pending, Testing, ""
+	default: // still Pending/Testing/"" after the wait budget → genuinely stuck
 		v.Pass = false
-		v.Reason = fmt.Sprintf("Arrival.phase=%q (not yet finalized)", phase)
+		v.Reason = fmt.Sprintf("Arrival.phase=%q (not finalized within %s)", phase, arrivalWaitBudget)
 	}
 
 	// Append forensics summary if present. Forensics-runner populates
@@ -553,6 +564,58 @@ func evaluatePostDeployQuill(ctx context.Context, dyn dynamic.Interface, namespa
 // the latest creation-timestamp item if none finalized. Lets the quill
 // produce a stable verdict even if multiple Arrivals match the same
 // service+version (e.g. across re-deploys in the same namespace).
+const (
+	// arrivalWaitBudget bounds how long the post-deploy quill waits for an
+	// in-flight (Testing/Pending) arrival to finalize before deciding — enough
+	// to cover a deploy that lands just ahead of its post-deploy test. Runs on
+	// its own context, independent of the gate's fast-path 60s timeout.
+	arrivalWaitBudget   = 3 * time.Minute
+	arrivalPollInterval = 10 * time.Second
+)
+
+// isInFlightPhase reports whether an arrival phase is non-terminal (still being
+// tested). Terminal phases: Passed, Skipped, Failed, Timeout.
+func isInFlightPhase(phase string) bool {
+	switch phase {
+	case "Passed", "Skipped", "Failed", "Timeout":
+		return false
+	default: // Pending, Testing, ""
+		return true
+	}
+}
+
+func arrivalPhaseOf(arr *unstructured.Unstructured) string {
+	p, _, _ := unstructured.NestedString(arr.Object, "status", "phase")
+	return p
+}
+
+// awaitArrivalFinal polls the arrival until it reaches a terminal phase or the
+// wait budget elapses, returning the latest arrival + phase seen. Own context,
+// so it can outlast the gate's fast-path timeout.
+func awaitArrivalFinal(dyn dynamic.Interface, namespace, selector string, last *unstructured.Unstructured) (*unstructured.Unstructured, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalWaitBudget)
+	defer cancel()
+	ticker := time.NewTicker(arrivalPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return last, arrivalPhaseOf(last)
+		case <-ticker.C:
+			l, err := dyn.Resource(arrivalGVR).Namespace(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+			if err != nil || len(l.Items) == 0 {
+				continue
+			}
+			a := pickLatestArrival(l.Items)
+			p := arrivalPhaseOf(a)
+			if !isInFlightPhase(p) {
+				return a, p
+			}
+			last = a
+		}
+	}
+}
+
 func pickLatestArrival(items []unstructured.Unstructured) *unstructured.Unstructured {
 	if len(items) == 0 {
 		return nil
