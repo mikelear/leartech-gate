@@ -304,3 +304,29 @@ func TestFindPriorFinalizedArrival_PrefersMostRecentByFinalizedAt(t *testing.T) 
 		t.Errorf("finalizedAt didn't survive round trip: %v", err)
 	}
 }
+
+// The post-deploy quill must treat an in-flight arrival (Testing/Pending/"") as
+// "wait", and only Passed/Skipped/Failed/Timeout as terminal — so a deploy that
+// lands ahead of its test isn't instant-failed.
+func TestIsInFlightPhase(t *testing.T) {
+	for _, p := range []string{"Passed", "Skipped", "Failed", "Timeout"} {
+		if isInFlightPhase(p) {
+			t.Errorf("phase %q must be terminal, got in-flight", p)
+		}
+	}
+	for _, p := range []string{"Testing", "Pending", ""} {
+		if !isInFlightPhase(p) {
+			t.Errorf("phase %q must be in-flight (wait), got terminal", p)
+		}
+	}
+}
+
+func TestArrivalPhaseOf(t *testing.T) {
+	arr := &unstructured.Unstructured{Object: map[string]any{"status": map[string]any{"phase": "Passed"}}}
+	if got := arrivalPhaseOf(arr); got != "Passed" {
+		t.Errorf("arrivalPhaseOf = %q, want Passed", got)
+	}
+	if got := arrivalPhaseOf(&unstructured.Unstructured{Object: map[string]any{}}); got != "" {
+		t.Errorf("arrivalPhaseOf(no status) = %q, want empty", got)
+	}
+}
