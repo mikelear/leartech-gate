@@ -12,8 +12,18 @@ RUN go mod download
 
 COPY . .
 
-# Generate Swagger docs before build (needed for the `docs` import in main.go)
-RUN make swag
+# The OpenAPI spec is NOT regenerated here. docs/ (including docs.go, which
+# main.go imports) is committed, and `swag-check` on the lint path fails the PR
+# if it drifts from the annotations — so the spec that ships is the one that was
+# reviewed.
+#
+# Regenerating at image-build time was actively harmful: it depended on whichever
+# swag the builder image happened to carry, which is the same class of bug that
+# made a stale v1.8.4 silently drop an enum and a security description from
+# plan-api's spec. It also broke outright on 2026-09-11 once `make swag`
+# delegated to the golden leartech-go.mk, because leartech-go-runtime ships make
+# and swag but no curl, so fetching the mk exited 127 and the container build
+# failed with "error building stage: exit status 2".
 
 # VERSION is baked into main.version for the /health/live payload.
 ARG VERSION=dev

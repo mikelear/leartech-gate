@@ -25,7 +25,7 @@ $(LEARTECH_GO_MK):
 lint: fetch-mk   ## golangci-lint via the merged config (delegates to golden leartech-go.mk::lint)
 	$(MAKE) SHELL=/bin/bash -f $(LEARTECH_GO_MK) lint
 
-build: swag
+build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o bin/server ./cmd/server
 
 test: fetch-mk   ## Unit tests (delegates to golden leartech-go.mk)
