@@ -43,18 +43,19 @@ spec:
               name: {{ .Values.database.secretName }}
               key: {{ .Values.database.secretKey }}
         {{- end }}
-        - name: AUTH_TOKENURL
-          value: {{ .Values.auth.tokenUrl | quote }}
-        - name: AUTH_CLIENTID
-          value: {{ .Values.auth.clientId | quote }}
-        - name: AUTH_CLIENTSECRET
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "leartech.fullname" . }}-auth
-              key: clientSecret
-              optional: true
-        - name: AUTH_AUDIENCE
-          value: {{ .Values.auth.audience | quote }}
+        # THE STANDARD INBOUND AUTH ENV SET. Two public values, both required,
+        # no secret and no toggle.
+        #
+        # This block used to render AUTH_TOKENURL / AUTH_CLIENTID /
+        # AUTH_CLIENTSECRET / AUTH_AUDIENCE — envconfig names derived from Go
+        # field names, matching nothing any other service renders. The three
+        # credential vars were never used either: leartech-gate validates
+        # tokens and mints none (its outbound work is GitHub with a PAT), so
+        # the secretKeyRef mounted a credential with no consumer.
+        - name: LEARTECH_AUTH_ISSUER
+          value: {{ required "auth.issuer is required — a resource server that cannot name its issuer must not start" .Values.auth.issuer | quote }}
+        - name: LEARTECH_AUTH_AUDIENCE
+          value: {{ required "auth.audience is required — RFC 8707 audience binding is not optional" .Values.auth.audience | quote }}
         securityContext:
           {{- include "leartech.containerSecurityContext" . | nindent 10 }}
         livenessProbe:

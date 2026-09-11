@@ -20,3 +20,24 @@ resources:
     memory: 64Mi
   limits:
     memory: 256Mi
+
+# Previews run with REAL auth, pointed at the cluster's own Hydra.
+#
+# The chart marks auth.issuer and auth.audience `required`, so this block is
+# not optional — a preview cannot render without it. That is deliberate: a
+# service that cannot verify a token must not deploy, and catching it at render
+# beats catching it at pod-start.
+#
+# There is no Secret to wait for. A go-common Verifier needs an issuer and an
+# audience, both PUBLIC — which is why previews can run real auth at all.
+#
+# Host is hydra-jx-staging.<domain>, verified on both clusters
+# (jx.leartech.com and az.leartech.com); the domain comes from jx-values.yaml,
+# which `jx preview create` populates per cluster.
+{{- $domain := .Values.jxRequirements.ingress.domain | default "" }}
+{{- if not $domain }}
+{{- fail "preview: jxRequirements.ingress.domain is empty, so the Hydra issuer cannot be derived. The chart marks auth.issuer required — fix jx-values.yaml rather than disabling auth." }}
+{{- end }}
+auth:
+  issuer: 'https://hydra-jx-staging.{{ $domain }}'
+  audience: leartech-gate

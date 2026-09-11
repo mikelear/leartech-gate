@@ -135,8 +135,25 @@ func run() error {
 	router.HEAD("/docs", docs)
 
 	// All non-health, non-metrics, non-docs routes require bearer auth.
+	//
+	// nil Permissions = "any token this issuer minted for this audience" —
+	// authentication without authorisation. That is the inherited template
+	// default and it is left deliberate rather than accidental: leartech-gate
+	// defines no per-capability scopes today. A service that does must pass
+	// them here instead of gating in handlers.
 	authed := router.Group("/api/v1")
-	authed.Use(middleware.BearerAuth(cfg.Auth))
+	bearer, err := middleware.BearerAuth(cfg.Auth, nil)
+	if err != nil {
+		return fmt.Errorf("build auth middleware: %w", err)
+	}
+	authed.Use(bearer)
+
+	// Report LEARTECH_AUTH_* values this service reads no meaning from, so a
+	// set-but-ignored credential is visible rather than quietly discarded.
+	if inert := config.InertAuthEnvSet(); len(inert) > 0 {
+		log.Warn().Strs("vars", inert).
+			Msg("auth: these LEARTECH_AUTH_* variables are set but IGNORED — leartech-gate is a resource server and verifies with issuer+audience only")
+	}
 
 	exampleHandler := handlers.NewExampleHandler(pool)
 	exampleHandler.RegisterRoutes(authed)

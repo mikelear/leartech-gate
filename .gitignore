@@ -25,3 +25,4 @@ pr-logs/
 # Local-only built binary (the source dir is cmd/gate-cli/; this matches
 # only the bare-name compiled artifact left by `go build .`).
 /gate-cli
+.leartech-go.mk

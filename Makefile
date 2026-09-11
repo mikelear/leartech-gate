@@ -1,4 +1,4 @@
-.PHONY: swag lint lint-config build test test-coverage
+.PHONY: swag lint fetch-mk build test test-coverage
 
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 SWAG_VERSION := v1.16.4
@@ -11,13 +11,26 @@ swag:
 	@rm -f cmd/server/main.go.bak
 	swag init -g cmd/server/main.go -o docs
 
-lint-config:
-	@command -v yq >/dev/null || { echo "yq required (brew install yq)"; exit 1; }
-	@curl -fsSL -o .golangci.base.yml $(GOLANGCI_BASE_URL)
-	@yq eval-all '. as $$item ireduce ({}; . *+ $$item)' .golangci.base.yml .golangci.yml > .golangci.merged.yml
+# ── Golden Go lint: delegate to the pipeline catalog ───────────────────────
+#
+# Runs go/leartech-go.mk from leartech-pipeline-catalog — the SAME file CI curls
+# in tasks/go-lint/pullrequest.yaml — so a laptop reproduces CI byte-for-byte
+# rather than approximately. Two implementations of one gate drift, and when
+# they do the local one is the weaker.
+LEARTECH_GO_MK_REF ?= main
+LEARTECH_GO_MK_URL ?= https://raw.githubusercontent.com/mikelear/leartech-pipeline-catalog/$(LEARTECH_GO_MK_REF)/go/leartech-go.mk
+LEARTECH_GO_MK     := .leartech-go.mk
 
-lint: lint-config
-	golangci-lint run --config .golangci.merged.yml ./...
+fetch-mk: $(LEARTECH_GO_MK)   ## Fetch the golden go/leartech-go.mk from pipeline-catalog
+
+$(LEARTECH_GO_MK):
+	@echo "==> fetching $(LEARTECH_GO_MK_URL)"
+	@curl -fsSL -o $@ $(LEARTECH_GO_MK_URL)
+
+# SHELL=/bin/bash: the golden mk uses bash-only syntax. CI images ship bash as
+# /bin/sh so the drift is invisible there; a laptop /bin/sh needs the override.
+lint: fetch-mk   ## golangci-lint via the merged config (delegates to golden leartech-go.mk::lint)
+	$(MAKE) SHELL=/bin/bash -f $(LEARTECH_GO_MK) lint
 
 build: swag
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o bin/server ./cmd/server

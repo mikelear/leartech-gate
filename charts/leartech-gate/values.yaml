@@ -83,10 +83,23 @@ migrations:
 
 # go-common auth.Config — populated as env vars with AUTH_ prefix
 auth:
-  tokenUrl: ""
-  clientId: ""
-  clientSecret: ""  # from ExternalSecret, not values
+  # The token issuer, enforced on every request under RFC 7519 4.1.1. No
+  # default: gcp and az run different Hydras, so a shared one is wrong
+  # everywhere. `required` in the template, so a chart rendered without it
+  # fails at render rather than producing a pod that cannot verify.
+  issuer: ""
+
+  # This service's own RFC 8707 audience. A token minted for a peer is refused
+  # here even when its scopes are correct.
   audience: ""
+
+  # NO tokenUrl / clientId / clientSecret. leartech-gate validates tokens and
+  # mints none — its outbound work is to GitHub with a PAT, which is not an
+  # OAuth2 client-credentials leg. They were only ever load-bearing as input to
+  # the dual-role ServiceClient's validateConfig, and an unused credential that
+  # gates startup is what took plan-api off the air on 2026-08-13.
+  #
+  # NO enabled / required flag. Auth is not conditional.
 
 probes:
   liveness: {}
