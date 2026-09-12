@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -313,41 +312,107 @@ func bodyReasonMatches(existingBody, reason string) bool {
 }
 
 // minimal issue shape for our needs.
+//
+// PullRequest is present ONLY on pull requests: GitHub's list-issues endpoint
+// returns PRs alongside issues, and the only reliable discriminator is the
+// presence of this object. The search API this code used to call could say
+// `is:issue`; the list API cannot, so the filtering moves here.
 type ghIssue struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	State  string `json:"state"`
+	Number      int             `json:"number"`
+	Title       string          `json:"title"`
+	Body        string          `json:"body"`
+	State       string          `json:"state"`
+	PullRequest *map[string]any `json:"pull_request,omitempty"`
 }
 
+func (i ghIssue) isPullRequest() bool { return i.PullRequest != nil }
+
+// listIssuesPageSize is GitHub's maximum for the list-issues endpoint.
+const listIssuesPageSize = 100
+
+// maxIssuePages bounds pagination. 10 pages = 1000 open issues in one repo; if
+// a repo ever exceeds that, findOpenIssue logs rather than silently returning
+// "no existing issue" and creating a duplicate.
+const maxIssuePages = 10
+
+// findOpenIssue looks for an open issue in `repo` whose title starts with
+// titlePrefix.
+//
+// THIS USES THE LIST API, NOT THE SEARCH API, AND THAT IS THE WHOLE POINT.
+//
+// It used to call GET /search/issues with `repo:… is:issue is:open in:title …`.
+// Measured 2026-09-11 on both clusters: every one of the 35 calls a qa-gate run
+// makes returned 403, on every run, so the issue lifecycle had never worked —
+// no issue was ever found, updated, deduped or closed.
+//
+// The cause is not the token. LeartechKeeperBot's PAT carries `repo` and the
+// same request returns 200 when made alone. GitHub rate-limits SEARCH at
+//
+//	x-ratelimit-limit: 30    per MINUTE
+//
+// while the core REST API allows 5000 per HOUR. The gate iterates ~35 services
+// per run, so it exceeded the search budget by construction even with a full
+// allowance — and both clusters' gates share this one bot token, so whichever
+// ran second got 403 on its FIRST call. That is why the failure looked like a
+// permissions problem rather than throttling: there were no early successes to
+// suggest a budget running out.
+//
+// GET /repos/{owner}/{repo}/issues is on the core limit, which makes 35 calls
+// per run a rounding error instead of 117% of the budget.
+//
+// Two behaviours have to be reproduced by hand because the list API cannot
+// express them as query terms:
+//
+//   - `is:issue` — the list endpoint returns pull requests too, filtered via
+//     isPullRequest() below.
+//   - `in:title <prefix>` — matched client-side, which this function already
+//     did anyway because the search API's title matching is fuzzy.
+//
+// A non-existent repo (chart-only deps like auth-postgresql / auth-mongodb)
+// returns 404 here, which the caller already treats as "no issue". Under the
+// search API those returned 403 like everything else, so the 404 branch was
+// dead code and every chart dep produced a warning too.
 func (c *IssueClient) findOpenIssue(ctx context.Context, repo, titlePrefix string) (*ghIssue, error) {
-	// Search restricted to the service repo + open state + our title prefix.
-	q := fmt.Sprintf("repo:%s is:issue is:open in:title %s", repo, titlePrefix)
-	apiURL := githubAPIBase + "/search/issues?q=" + url.QueryEscape(q)
-	body, err := c.getJSON(ctx, apiURL)
-	if err != nil {
-		// Repo doesn't exist (chart-only deps like auth-postgresql,
-		// auth-mongodb that aren't real leartech repos). GitHub returns
-		// 422 Unprocessable Entity for `repo:` queries against missing
-		// repos. Treat as "no issue" rather than an error so we don't
-		// spam warnings on every gate run for every chart dep.
-		if strings.Contains(err.Error(), "→ 422") || strings.Contains(err.Error(), "→ 404") {
+	for page := 1; page <= maxIssuePages; page++ {
+		apiURL := fmt.Sprintf("%s/repos/%s/issues?state=open&per_page=%d&page=%d",
+			githubAPIBase, repo, listIssuesPageSize, page)
+
+		body, err := c.getJSON(ctx, apiURL)
+		if err != nil {
+			// Repo doesn't exist (chart-only deps that aren't real leartech
+			// repos). Treat as "no issue" rather than an error so we don't spam
+			// warnings on every gate run for every chart dep.
+			if strings.Contains(err.Error(), "→ 404") || strings.Contains(err.Error(), "→ 422") {
+				return nil, nil
+			}
+			return nil, err
+		}
+
+		var items []ghIssue
+		if err := json.Unmarshal(body, &items); err != nil {
+			return nil, fmt.Errorf("parse issue list for %s: %w", repo, err)
+		}
+
+		for i := range items {
+			if items[i].isPullRequest() {
+				continue
+			}
+			if strings.HasPrefix(items[i].Title, titlePrefix) {
+				return &items[i], nil
+			}
+		}
+
+		// Short page means last page.
+		if len(items) < listIssuesPageSize {
 			return nil, nil
 		}
-		return nil, err
 	}
-	var resp struct {
-		Items []ghIssue `json:"items"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-	for i := range resp.Items {
-		if strings.HasPrefix(resp.Items[i].Title, titlePrefix) {
-			return &resp.Items[i], nil
-		}
-	}
-	return nil, nil
+
+	// Bounded scan exhausted. Say so: silently returning nil here would create a
+	// duplicate issue on every run for a repo this busy.
+	return nil, fmt.Errorf("scanned %d pages (%d open issues) of %s without finding %q and more remain; "+
+		"raise maxIssuePages or label gate issues so they can be filtered server-side",
+		maxIssuePages, maxIssuePages*listIssuesPageSize, repo, titlePrefix)
 }
 
 func (c *IssueClient) createIssue(ctx context.Context, repo, title, body string) (int, error) {
@@ -401,6 +466,19 @@ func (c *IssueClient) closeIssue(ctx context.Context, repo string, number int) e
 
 // HTTP helpers.
 
+// githubMessage extracts GitHub's `message` field for error text, formatted as
+// a parenthetical suffix. Returns "" if absent or unparseable, so a malformed
+// error response degrades to bare status text rather than failing the caller.
+func githubMessage(body []byte) string {
+	var e struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil || strings.TrimSpace(e.Message) == "" {
+		return ""
+	}
+	return " (" + e.Message + ")"
+}
+
 func (c *IssueClient) getJSON(ctx context.Context, apiURL string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -417,11 +495,22 @@ func (c *IssueClient) getJSON(ctx context.Context, apiURL string) ([]byte, error
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		// Don't include response body in error — GitHub error responses
-		// are predictable (status text suffices), and avoiding body
-		// echoing means we can't accidentally leak Authorization-header
-		// reflections or rate-limit headers in error chains.
-		return nil, fmt.Errorf("GET %s → %d %s", apiURL, resp.StatusCode, http.StatusText(resp.StatusCode))
+		// Include GitHub's `message` field ONLY — never the raw body or the
+		// headers. The original version omitted everything, on the reasoning
+		// that status text suffices and that echoing the body risks leaking
+		// Authorization reflections or rate-limit headers. The first half of
+		// that was wrong and it cost real time: a 403 from THROTTLING and a 403
+		// from a MISSING SCOPE are the same status text and need opposite
+		// fixes, so "403 Forbidden" alone sent the 2026-09-11 investigation
+		// after the token when the token was fine. GitHub says
+		// "API rate limit exceeded for ..." vs "Resource not accessible by ...",
+		// which resolves it immediately.
+		//
+		// `message` is a fixed, human-readable field; it never contains
+		// credentials, and parsing just that key means a future GitHub response
+		// shape cannot widen what gets logged.
+		return nil, fmt.Errorf("GET %s → %d %s%s",
+			apiURL, resp.StatusCode, http.StatusText(resp.StatusCode), githubMessage(body))
 	}
 	return body, nil
 }
