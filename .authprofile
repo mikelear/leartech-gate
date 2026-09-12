@@ -1,0 +1,15 @@
+# What kind of auth participant this service is.
+#
+# Read by the pipeline-catalog auth-conformance gate, which CROSS-CHECKS this
+# declaration against what the code actually does and fails on a contradiction
+# (`authconformance --explain` prints the full standard).
+#
+# It is declared rather than inferred because inference guesses — a derived
+# heuristic once reported this platform's own SPA client as a stranger holding
+# internal audiences — and it is cross-checked because a declaration drifts the
+# moment someone adds an outbound call.
+#
+# The correct auth env set and chart shape are a function of this type. There is
+# no single standard set: an inbound-only service given CLIENT_ID/CLIENT_SECRET
+# looks like it holds an identity it never spends.
+type: inbound-resource-server
