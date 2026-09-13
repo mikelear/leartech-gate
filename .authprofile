@@ -1,0 +1,28 @@
+# What kind of auth participant this service is.
+#
+# Read by the pipeline-catalog auth-conformance gate, which CROSS-CHECKS this
+# declaration against what the code actually does and fails on a contradiction
+# (`authconformance --explain` prints the full standard).
+#
+# Declared rather than inferred because inference guesses, and cross-checked
+# because a declaration drifts the moment someone adds an outbound call.
+#
+# inbound-resource-server, and this repo already argued the case in code before
+# it declared it:
+#
+#   internal/middleware/auth.go  builds auth.NewVerifier — the inbound-only
+#                                constructor — and its comment notes that
+#                                NewServiceClient is the dual-role one, whose
+#                                validateConfig "also demands ClientID +
+#                                ClientSecret, credentials this service does
+#                                not need"
+#   internal/config/config.go    lists LEARTECH_AUTH_CLIENT_ID, CLIENT_SECRET,
+#                                TARGET_AUDIENCE and SERVER_URL as inertAuthEnv:
+#                                variables it reads NO meaning from, reported at
+#                                boot rather than silently ignored
+#
+# A service holding CLIENT_ID/CLIENT_SECRET it never spends looks like it
+# carries an identity it does not, which is how inert credentials reach charts
+# and how an operator comes to believe a variable is load-bearing. This file
+# makes the gate check that story rather than trusting it.
+type: inbound-resource-server
