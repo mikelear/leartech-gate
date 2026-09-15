@@ -41,3 +41,11 @@ resources:
 auth:
   issuer: 'https://hydra-jx-staging.{{ $domain }}'
   audience: leartech-gate
+
+# Gateway API, previews ONLY. Ingress is decommissioned on all three clusters,
+# so a preview rendering an Ingress 404s. Long-lived staging and production
+# hostnames are owned centrally by charts/cluster-routes in the cluster GitOps
+# repos, and two HTTPRoutes claiming one hostname is ambiguous — which is why
+# this is not set in the chart defaults.
+gateway:
+  enabled: true
