@@ -13,7 +13,7 @@ require (
 	github.com/mikelear/leartech-go-common v1.4.0
 	github.com/prometheus/client_golang v1.20.5
 	github.com/rs/zerolog v1.33.0
-	github.com/swaggest/swgui v1.8.2
+	github.com/swaggest/swgui v1.8.9
 	github.com/swaggo/swag v1.16.6
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.68.0
 	gopkg.in/yaml.v3 v3.0.1
