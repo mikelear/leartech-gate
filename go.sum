@@ -182,6 +182,8 @@ github.com/mikelear/leartech-go-common v1.4.0 h1:HEfDZjUj9stNruA43o5LUtnVWNCarUM
 github.com/mikelear/leartech-go-common v1.4.0/go.mod h1:NJpq4zPpOF1JOB1+6bRmLDgXe/55/7EROPRQHwpb0QQ=
 github.com/mikelear/leartech-go-common v1.5.0 h1:TbsSrc5fuKd4ksanI/EeDfKXlCCz+OTwpWjd8/A6NXQ=
 github.com/mikelear/leartech-go-common v1.5.0/go.mod h1:NJpq4zPpOF1JOB1+6bRmLDgXe/55/7EROPRQHwpb0QQ=
+github.com/mikelear/leartech-go-common v1.6.1 h1:l3v3D9rq1udzb+H+Ecu7gMucL0xMUMMTHplHZ9Gsd6U=
+github.com/mikelear/leartech-go-common v1.6.1/go.mod h1:NJpq4zPpOF1JOB1+6bRmLDgXe/55/7EROPRQHwpb0QQ=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
 github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd h1:TRLaZ9cD/w8PVh93nsPXa1VrQ6jlwL5oN8l14QlcNfg=
 github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
