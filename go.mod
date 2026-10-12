@@ -2,7 +2,7 @@ module github.com/mikelear/leartech-gate
 
 go 1.26.0
 
-toolchain go1.27.1
+toolchain go1.27.2
 
 require (
 	github.com/MicahParks/jwkset v0.11.3
